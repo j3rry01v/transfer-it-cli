@@ -1,14 +1,17 @@
-# Transfer.it File Uploader
+# Transfer.it CLI Uploader
 
-A simple command-line tool to upload files to transfer.it using browser automation with Playwright.
+A modern, colorful command-line tool to upload files to transfer.it with beautiful terminal UI and real-time progress tracking.
 
 ## Features
 
-- Upload files of any size to transfer.it
-- Real-time progress monitoring
-- Automatic share link generation
-- Error handling with screenshots
-- Cross-platform support (macOS, Linux, Windows)
+- 🎨 **Beautiful Terminal UI** - Colorful progress bars, styled tables, and modern interface
+- 📊 **Real-time Progress Tracking** - Live upload progress with speed and ETA display
+- 📁 **File Information Display** - Elegant file details with size and path
+- 🔗 **Automatic Share Link Generation** - Clickable links in terminal
+- ⚡ **Smart Size Parsing** - Supports GB, MB, KB with accurate progress calculation
+- 🛡️ **Robust Error Handling** - Visual error indicators with debug screenshots
+- 🌍 **Cross-platform Support** - Works on macOS, Linux, and Windows
+- ⏱️ **Upload Timeout Protection** - 5-minute timeout to prevent hanging
 
 ## Installation
 
@@ -26,7 +29,7 @@ source .venv/bin/activate  # On Windows: .venv\Scripts\activate
 
 3. Install dependencies:
 ```bash
-pip install playwright
+pip install -r requirements.txt
 playwright install chromium
 ```
 
@@ -42,16 +45,47 @@ python3 transfer-it-uploader.py /path/to/your/file
 python3 transfer-it-uploader.py ~/Downloads/document.pdf
 ```
 
-The tool will:
-1. Open transfer.it in a headless browser
-2. Upload your file
-3. Monitor the upload progress
-4. Generate and return a shareable link
+### What You'll See
+
+The tool provides a beautiful, modern interface with:
+
+- 📁 **File Information Panel** - Shows file name, size, and path in a styled table
+- 🚀 **Initialization Progress** - Spinner showing browser startup and page loading
+- 📤 **Upload Progress Bar** - Real-time progress with:
+  - Current uploaded size vs total size
+  - Upload speed (MB/s)
+  - ETA in H:M:S format
+  - Visual progress bar with percentage
+- 🎉 **Success Display** - Elegant results panel with clickable share link
+
+### Sample Output
+
+```
+🚀 Transfer.it CLI Uploader
+
+┌─────────────────── 📁 File Information ───────────────────┐
+│ Property  │ Value                                         │
+│ File Name │ document.pdf                                  │
+│ File Size │ 15.30 MB                                      │
+│ File Path │ /Users/username/Downloads/document.pdf        │
+└───────────────────────────────────────────────────────────┘
+
+🚀 Starting upload...
+⠋ 📤 8.45 MB / 15.30 MB • 2.1 MB/s ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━  55% ETA: 0:00:03
+
+🎉 SUCCESS! Your file has been uploaded successfully!
+┌─────────────────────────────────────────────────────────────┐
+│ 📁 File       │ document.pdf                                │
+│ 🔗 Share Link │ https://transfer.it/t/abc123def456          │
+│ 📋 Status     │ ✅ Ready to share                           │
+└─────────────────────────────────────────────────────────────┘
+```
 
 ## Requirements
 
 - Python 3.7+
-- Playwright
+- Playwright (for browser automation)
+- Rich (for beautiful terminal UI)
 - Chromium browser (installed via Playwright)
 
 ## How it Works
@@ -66,10 +100,18 @@ This tool uses Playwright to automate a Chromium browser and interact with the t
 
 ## Error Handling
 
-If an error occurs during upload, the tool will:
-- Display an error message
-- Save a screenshot as `transfer_it_error.png` for debugging
-- Exit with an error code
+The tool includes comprehensive error handling with visual feedback:
+
+- ❌ **Clear Error Messages** - Color-coded error display with emojis
+- 📸 **Debug Screenshots** - Automatic screenshots saved for troubleshooting
+- ⏱️ **Timeout Protection** - 5-minute upload timeout prevents hanging
+- 🔄 **Fallback Methods** - Multiple approaches for link extraction
+- 🎯 **Specific Error Types** - Different handling for file not found, upload failures, etc.
+
+### Debug Files
+
+- `transfer_it_error.png` - Screenshot when general errors occur
+- `transfer_it_debug.png` - Screenshot when link extraction fails
 
 ## License
 
