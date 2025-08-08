@@ -2,6 +2,11 @@
 import sys
 import os
 import time
+import signal
+import atexit
+import termios
+import tty
+import subprocess
 from playwright.sync_api import sync_playwright
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeRemainingColumn
@@ -11,6 +16,107 @@ from rich.table import Table
 from rich import box
 
 console = Console()
+browser_instance = None
+original_terminal_settings = None
+
+def setup_terminal_for_progress():
+    """Configure terminal to allow Ctrl+C while minimizing interference"""
+    global original_terminal_settings
+    if sys.stdin.isatty():
+        try:
+            original_terminal_settings = termios.tcgetattr(sys.stdin.fileno())
+            new_settings = termios.tcgetattr(sys.stdin.fileno())
+            new_settings[3] = new_settings[3] & ~termios.ECHO
+            termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, new_settings)
+        except:
+            pass
+
+def restore_terminal_input():
+    """Restore original terminal input settings"""
+    global original_terminal_settings
+    if original_terminal_settings and sys.stdin.isatty():
+        try:
+            termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, original_terminal_settings)
+        except:
+            pass
+
+def kill_existing_browsers(show_message=False):
+    """
+    Terminate existing browser processes to prevent resource leaks.
+    
+    Playwright browsers can sometimes persist after script interruption (Ctrl+C),
+    leading to memory accumulation and system resource exhaustion. This function
+    ensures a clean environment by terminating any orphaned browser processes
+    before launching new instances.
+    """
+    processes_found = False
+    
+    try:
+        check_result = subprocess.run(['pgrep', '-f', 'chromium|chrome|playwright'], 
+                                    capture_output=True, text=True)
+        if check_result.returncode == 0 and check_result.stdout.strip():
+            processes_found = True
+        
+        if processes_found and show_message:
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("🧹 Cleaning up existing browser processes..."),
+                console=console,
+                transient=True
+            ) as cleanup_progress:
+                cleanup_task = cleanup_progress.add_task("cleanup", total=None)
+                
+                subprocess.run(['pkill', '-f', 'chromium'], capture_output=True)
+                subprocess.run(['pkill', '-f', 'chrome'], capture_output=True)
+                subprocess.run(['pkill', '-f', 'playwright'], capture_output=True)
+                
+                time.sleep(1)
+                
+                subprocess.run(['pkill', '-9', '-f', 'chromium'], capture_output=True)
+                subprocess.run(['pkill', '-9', '-f', 'chrome'], capture_output=True)
+                subprocess.run(['pkill', '-9', '-f', 'playwright'], capture_output=True)
+        elif processes_found:
+            # Silent cleanup 
+            # TODO: WINDOWS OS CLEANUP
+            subprocess.run(['pkill', '-f', 'chromium'], capture_output=True)
+            subprocess.run(['pkill', '-f', 'chrome'], capture_output=True)
+            subprocess.run(['pkill', '-f', 'playwright'], capture_output=True)
+            
+            time.sleep(1)
+            
+            subprocess.run(['pkill', '-9', '-f', 'chromium'], capture_output=True)
+            subprocess.run(['pkill', '-9', '-f', 'chrome'], capture_output=True)
+            subprocess.run(['pkill', '-9', '-f', 'playwright'], capture_output=True)
+        
+    except Exception:
+        try:
+            if sys.platform == "darwin":
+                subprocess.run(['killall', '-9', 'Chromium'], capture_output=True)
+                subprocess.run(['killall', '-9', 'Google Chrome'], capture_output=True)
+        except:
+            pass
+
+def cleanup_browser():
+    """Clean up browser instance on exit"""
+    global browser_instance
+    restore_terminal_input()
+    if browser_instance:
+        try:
+            browser_instance.close()
+        except:
+            pass
+    kill_existing_browsers(show_message=False)
+
+def signal_handler(signum, frame):
+    """Handle Ctrl+C gracefully"""
+    console.print("\n[yellow]⚠️ Upload cancelled by user[/yellow]")
+    cleanup_browser()
+    sys.exit(0)
+
+# Register cleanup handlers
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
+atexit.register(cleanup_browser)
 
 def show_file_info(file_path):
     file_name = os.path.basename(file_path)
@@ -34,6 +140,8 @@ def upload_to_transfer_it(file_path):
         return None
     
     file_name, file_size_mb = show_file_info(file_path)
+
+    kill_existing_browsers(show_message=True)
     
     with Progress(
         SpinnerColumn(),
@@ -45,10 +153,12 @@ def upload_to_transfer_it(file_path):
         init_task = progress.add_task("🚀 Initializing browser...", total=None)
         
         with sync_playwright() as p:
-            browser = p.chromium.launch(
+            global browser_instance
+            browser_instance = p.chromium.launch(
                 headless=True,
                 args=['--disable-blink-features=AutomationControlled']
             )
+            browser = browser_instance
             context = browser.new_context(
                 viewport={'width': 1280, 'height': 720},
                 user_agent='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
@@ -80,83 +190,94 @@ def upload_to_transfer_it(file_path):
                 )
                 
                 transfer_button.click()
-                progress.remove_task(init_task)
-            
+                progress.update(init_task, description="⏳ Preparing upload...")
+                
                 page.wait_for_timeout(3000)
+                progress.remove_task(init_task)
                 
-                console.print("\n🚀 [bold green]Starting upload...[/bold green]")
+                setup_terminal_for_progress()
                 
-                with Progress(
-                    SpinnerColumn(),
-                    TextColumn("[progress.description]{task.description}"),
-                    BarColumn(),
-                    TaskProgressColumn(),
-                    TextColumn("ETA:"),
-                    TimeRemainingColumn(),
-                    console=console
-                ) as upload_progress:
-                    
-                    upload_task = upload_progress.add_task("📤 Uploading...", total=100)
-                    upload_timeout = 300
-                    start_time = time.time()
-                    
-                    while time.time() - start_time < upload_timeout:
-                        try:
-                            if (page.locator('h4:has-text("Completed!")').is_visible() or 
-                                page.locator('section.transferring-box.completed').count() > 0 or
-                                page.locator('.js-copy-link:not(.disabled)').is_visible()):
-                                upload_progress.update(upload_task, completed=100, description="✅ Upload completed!")
-                                break
-                            
-                            try:
-                                uploaded_elem = page.locator('.status-info.transfer span.uploaded').first
-                                if uploaded_elem.is_visible():
-                                    uploaded_text = uploaded_elem.text_content()
-                                    size_elem = page.locator('.status-info.transfer span.size').first
-                                    total_size_text = size_elem.text_content() if size_elem.is_visible() else "unknown"
-                                    
-                                    def parse_size_to_mb(size_text):
-                                        """Convert size text to MB for calculation"""
-                                        size_text = size_text.strip()
-                                        if 'GB' in size_text:
-                                            return float(size_text.replace('GB', '').strip()) * 1024
-                                        elif 'MB' in size_text:
-                                            return float(size_text.replace('MB', '').strip())
-                                        elif 'KB' in size_text:
-                                            return float(size_text.replace('KB', '').strip()) / 1024
-                                        else:
-                                            return 0
-                                    
-                                    try:
-                                        uploaded_mb = parse_size_to_mb(uploaded_text)
-                                        total_mb = parse_size_to_mb(total_size_text)
-                                        
-                                        if total_mb > 0:
-                                            progress_percent = min((uploaded_mb / total_mb) * 100, 100)
-                                        else:
-                                            progress_percent = 0
-                                        
-                                        speed_elem = page.locator('.status-info.transfer span.speed').first
-                                        speed_text = speed_elem.text_content() if speed_elem.is_visible() else ""
-                                        
-                                        description = f"📤 {uploaded_text} / {total_size_text}"
-                                        if speed_text:
-                                            description += f" • {speed_text}"
-                                        
-                                        upload_progress.update(upload_task, completed=progress_percent, description=description)
-                                    except Exception as parse_error:
-                                        upload_progress.update(upload_task, description=f"📤 {uploaded_text} / {total_size_text}")
-                            except:
-                                pass
-                            
-                        except Exception as e:
-                            console.print(f"[yellow]⚠️ Progress monitoring: {e}[/yellow]")
+                try:
+                    with Progress(
+                        SpinnerColumn(),
+                        TextColumn("[progress.description]{task.description}"),
+                        BarColumn(),
+                        TaskProgressColumn(),
+                        TextColumn("ETA:"),
+                        TimeRemainingColumn(),
+                        console=console
+                    ) as upload_progress:
                         
-                        page.wait_for_timeout(1000)
-                    
-                    if time.time() - start_time >= upload_timeout:
-                        console.print("[red]❌ Upload timed out after 5 minutes[/red]")
-                        return None
+                        upload_task = upload_progress.add_task("🚀 Initializing transfer...", total=100)
+                        upload_timeout = 300
+                        start_time = time.time()
+                        upload_started = False
+                        
+                        while time.time() - start_time < upload_timeout:
+                            try:
+                                if (page.locator('h4:has-text("Completed!")').is_visible() or 
+                                    page.locator('section.transferring-box.completed').count() > 0 or
+                                    page.locator('.js-copy-link:not(.disabled)').is_visible()):
+                                    upload_progress.update(upload_task, completed=100, description="✅ Transfer complete!")
+                                    break
+                            
+                                try:
+                                    uploaded_elem = page.locator('.status-info.transfer span.uploaded').first
+                                    if uploaded_elem.is_visible():
+                                        # Update status to show transfer is active
+                                        if not upload_started:
+                                            upload_started = True
+                                        
+                                        uploaded_text = uploaded_elem.text_content()
+                                        size_elem = page.locator('.status-info.transfer span.size').first
+                                        total_size_text = size_elem.text_content() if size_elem.is_visible() else "unknown"
+                                        
+                                        def parse_size_to_mb(size_text):
+                                            """Convert size text to MB for calculation"""
+                                            size_text = size_text.strip()
+                                            if 'GB' in size_text:
+                                                return float(size_text.replace('GB', '').strip()) * 1024
+                                            elif 'MB' in size_text:
+                                                return float(size_text.replace('MB', '').strip())
+                                            elif 'KB' in size_text:
+                                                return float(size_text.replace('KB', '').strip()) / 1024
+                                            else:
+                                                return 0
+                                        
+                                        try:
+                                            uploaded_mb = parse_size_to_mb(uploaded_text)
+                                            total_mb = parse_size_to_mb(total_size_text)
+                                            
+                                            if total_mb > 0:
+                                                progress_percent = min((uploaded_mb / total_mb) * 100, 100)
+                                            else:
+                                                progress_percent = 0
+                                            
+                                            speed_elem = page.locator('.status-info.transfer span.speed').first
+                                            speed_text = speed_elem.text_content() if speed_elem.is_visible() else ""
+                                            
+                                            description = f"📤 {uploaded_text} / {total_size_text}"
+                                            if speed_text:
+                                                description += f" • {speed_text}"
+                                            
+                                            upload_progress.update(upload_task, completed=progress_percent, description=description)
+                                        except Exception as parse_error:
+                                            upload_progress.update(upload_task, description=f"📤 {uploaded_text} / {total_size_text}")
+                                except:
+                                    pass
+                                
+                            except Exception as e:
+                                console.print(f"[yellow]⚠️ Progress monitoring: {e}[/yellow]")
+                            
+                            page.wait_for_timeout(1000)
+                        
+                        if time.time() - start_time >= upload_timeout:
+                            console.print("[red]❌ Upload timed out after 5 minutes[/red]")
+                            return None
+                
+                finally:
+                    # Always restore terminal input
+                    restore_terminal_input()
             
                 console.print("\n🔗 [bold cyan]Extracting share link...[/bold cyan]")
                 page.wait_for_timeout(2000)
@@ -249,7 +370,8 @@ def upload_to_transfer_it(file_path):
                 return None
                 
             finally:
-                browser.close()
+                cleanup_browser()
+                browser_instance = None
 
 def show_usage():
     console.print(Panel.fit(
