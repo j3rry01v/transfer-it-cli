@@ -209,11 +209,12 @@ def upload_to_transfer_it(file_path):
                     ) as upload_progress:
                         
                         upload_task = upload_progress.add_task("🚀 Initializing transfer...", total=100)
-                        upload_timeout = 300
+                        
                         start_time = time.time()
+                        last_activity_time = time.time()
                         upload_started = False
                         
-                        while time.time() - start_time < upload_timeout:
+                        while True:
                             try:
                                 if (page.locator('h4:has-text("Completed!")').is_visible() or 
                                     page.locator('section.transferring-box.completed').count() > 0 or
@@ -261,19 +262,24 @@ def upload_to_transfer_it(file_path):
                                                 description += f" • {speed_text}"
                                             
                                             upload_progress.update(upload_task, completed=progress_percent, description=description)
+                                            last_activity_time = time.time()
                                         except Exception as parse_error:
                                             upload_progress.update(upload_task, description=f"📤 {uploaded_text} / {total_size_text}")
+                                            last_activity_time = time.time()
                                 except:
                                     pass
                                 
                             except Exception as e:
                                 console.print(f"[yellow]⚠️ Progress monitoring: {e}[/yellow]")
                             
+                            # Only timeout if completely stalled (no activity for 15 minutes)
+                            stall_timeout = 900  # 15 minutes without any activity
+                            if time.time() - last_activity_time > stall_timeout:
+                                console.print(f"[red]❌ Upload appears stalled - no activity for {stall_timeout//60} minutes[/red]")
+                                console.print("[dim]This indicate a network issue or browser problem[/dim]")
+                                return None
+                            
                             page.wait_for_timeout(1000)
-                        
-                        if time.time() - start_time >= upload_timeout:
-                            console.print("[red]❌ Upload timed out after 5 minutes[/red]")
-                            return None
                 
                 finally:
                     # Always restore terminal input
