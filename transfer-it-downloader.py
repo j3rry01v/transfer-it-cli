@@ -1,8 +1,3 @@
-#!/usr/bin/env python3
-"""
-Transfer.it CLI Downloader
-Download files from transfer.it links with progress tracking and browser automation
-"""
 
 import sys
 import os
@@ -12,7 +7,6 @@ import atexit
 import termios
 import tty
 import subprocess
-import shutil
 from pathlib import Path
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 from rich.console import Console
@@ -78,7 +72,6 @@ def kill_existing_browsers(show_message=False):
                 subprocess.run(['pkill', '-9', '-f', 'chrome'], capture_output=True)
                 subprocess.run(['pkill', '-9', '-f', 'playwright'], capture_output=True)
         elif processes_found:
-            # Silent cleanup
             subprocess.run(['pkill', '-f', 'chromium'], capture_output=True)
             subprocess.run(['pkill', '-f', 'chrome'], capture_output=True)
             subprocess.run(['pkill', '-f', 'playwright'], capture_output=True)
@@ -111,7 +104,6 @@ def signal_handler(signum, frame):
     cleanup_browser()
     sys.exit(0)
 
-# Register cleanup handlers
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 atexit.register(cleanup_browser)
@@ -127,6 +119,47 @@ def show_transfer_info(transfer_url):
     
     console.print(Panel(table, title="📁 Transfer Information", border_style="blue"))
 
+def extract_file_info(page):
+    """Extract file information from the page"""
+    file_info = {}
+    try:
+        file_name_elem = page.locator('.ready-to-download-box .link-info .title').first
+        if file_name_elem.is_visible():
+            file_info['name'] = file_name_elem.text_content().strip()
+            console.print(f"[cyan]📄 File: {file_info['name']}[/cyan]")
+        
+        file_size_elem = page.locator('.ready-to-download-box .it-grid-info .size').first
+        if file_size_elem.is_visible():
+            file_info['size'] = file_size_elem.text_content().strip()
+            console.print(f"[cyan]📊 Size: {file_info['size']}[/cyan]")
+        
+        file_count_elem = page.locator('.ready-to-download-box .it-grid-info .num').first
+        if file_count_elem.is_visible():
+            file_info['count'] = file_count_elem.text_content().strip()
+            console.print(f"[cyan]📁 Files: {file_info['count']}[/cyan]")
+    except:
+        pass
+    return file_info
+
+def find_download_button(page):
+    """Locate the download button on the page"""
+    button_selectors = [
+        'button.it-button.xl-size.js-download:has(span:has-text("Download all"))',
+        'button.js-download',
+        'button:has-text("Download all")',
+        '.ready-to-download-box button.js-download'
+    ]
+    
+    for selector in button_selectors:
+        try:
+            btn = page.locator(selector).first
+            if btn.is_visible():
+                console.print("[green]✅ Download button found[/green]")
+                return btn
+        except:
+            continue
+    return None
+
 def download_from_transfer_it(transfer_url, output_dir="./downloads"):
     """Main function to download from transfer.it"""
     
@@ -135,8 +168,6 @@ def download_from_transfer_it(transfer_url, output_dir="./downloads"):
         return None
     
     show_transfer_info(transfer_url)
-    
-    # Clean up existing browser processes
     kill_existing_browsers(show_message=True)
     
     with Progress(
@@ -150,76 +181,29 @@ def download_from_transfer_it(transfer_url, output_dir="./downloads"):
         with sync_playwright() as p:
             global browser_instance
             browser_instance = p.chromium.launch(
-                headless=True,  # Can be True or False
+                headless=True,
                 args=['--disable-blink-features=AutomationControlled']
             )
             browser = browser_instance
             
-            # Create context with download handling enabled
             context = browser.new_context(
                 viewport={'width': 1280, 'height': 720},
                 user_agent='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                accept_downloads=True  # Important: Enable download handling
+                accept_downloads=True
             )
             
             page = context.new_page()
             
             try:
                 progress.update(init_task, description="🌐 Opening transfer.it link...")
-                
-                # Navigate to the transfer page
                 page.goto(transfer_url, wait_until="networkidle", timeout=30000)
                 progress.update(init_task, description="⏳ Waiting for page to load...")
-                
-                # Wait for the page to fully load
                 page.wait_for_timeout(3000)
                 
-                # Variables to store file info
-                file_name = None
-                file_size = None
-                
-                # Try to extract file information from the page
-                try:
-                    # Look for file name in the ready-to-download section
-                    file_name_elem = page.locator('.ready-to-download-box .link-info .title').first
-                    if file_name_elem.is_visible():
-                        file_name = file_name_elem.text_content().strip()
-                        console.print(f"[cyan]📄 File: {file_name}[/cyan]")
-                    
-                    # Look for file size
-                    file_size_elem = page.locator('.ready-to-download-box .it-grid-info .size').first
-                    if file_size_elem.is_visible():
-                        file_size_text = file_size_elem.text_content().strip()
-                        console.print(f"[cyan]📊 Size: {file_size_text}[/cyan]")
-                    
-                    # Look for file count
-                    file_count_elem = page.locator('.ready-to-download-box .it-grid-info .num').first
-                    if file_count_elem.is_visible():
-                        file_count = file_count_elem.text_content().strip()
-                        console.print(f"[cyan]📁 Files: {file_count}[/cyan]")
-                except:
-                    pass
+                file_info = extract_file_info(page)
                 
                 progress.update(init_task, description="🔍 Looking for download button...")
-                
-                # Find the download button
-                download_button = None
-                button_selectors = [
-                    'button.it-button.xl-size.js-download:has(span:has-text("Download all"))',
-                    'button.js-download',
-                    'button:has-text("Download all")',
-                    '.ready-to-download-box button.js-download'
-                ]
-                
-                for selector in button_selectors:
-                    try:
-                        btn = page.locator(selector).first
-                        if btn.is_visible():
-                            download_button = btn
-                            console.print("[green]✅ Download button found[/green]")
-                            break
-                    except:
-                        continue
+                download_button = find_download_button(page)
                 
                 if not download_button:
                     console.print("[red]❌ Download button not found[/red]")
@@ -228,33 +212,22 @@ def download_from_transfer_it(transfer_url, output_dir="./downloads"):
                 progress.update(init_task, description="🎯 Initiating download...")
                 console.print("[cyan]🖱️ Clicking download button...[/cyan]")
                 
-                # Start waiting for the download before clicking the button
                 with page.expect_download(timeout=30000) as download_info:
-                    # Click the download button
                     download_button.click()
                     console.print("[cyan]⏳ Waiting for download to start...[/cyan]")
                 
-                # Get the download object
                 download = download_info.value
-                
                 progress.remove_task(init_task)
                 
-                # Get download information
                 download_url = download.url
-                suggested_filename = download.suggested_filename
-                
-                if not file_name:
-                    file_name = suggested_filename
+                file_name = file_info.get('name', download.suggested_filename)
                 
                 console.print(f"[green]✅ Download started![/green]")
                 console.print(f"[cyan]📄 Filename: {file_name}[/cyan]")
-                console.print(f"[cyan]🔗 Download URL: {download_url[:80]}...[/cyan]" if len(download_url) > 80 else f"[cyan]🔗 Download URL: {download_url}[/cyan]")
                 
-                # Create output directory if it doesn't exist
                 os.makedirs(output_dir, exist_ok=True)
                 output_path = os.path.join(output_dir, file_name)
                 
-                # Show download progress
                 setup_terminal_for_progress()
                 
                 with Progress(
@@ -268,22 +241,17 @@ def download_from_transfer_it(transfer_url, output_dir="./downloads"):
                 ) as download_progress:
                     task = download_progress.add_task(f"📥 Downloading {file_name}...", total=100)
                     
-                    # Monitor download progress
                     start_time = time.time()
-                    timeout = 300  # 5 minutes timeout
+                    timeout = 300
                     
                     while time.time() - start_time < timeout:
-                        # Check if download is finished
                         if download.path():
-                            # Download completed
                             download_progress.update(task, completed=100)
                             break
                         
-                        # Update progress (estimate based on time)
                         elapsed = time.time() - start_time
-                        estimated_progress = min((elapsed / 30) * 100, 99)  # Estimate based on typical download time
+                        estimated_progress = min((elapsed / 30) * 100, 99)
                         download_progress.update(task, completed=estimated_progress)
-                        
                         time.sleep(0.5)
                     
                     if not download.path():
@@ -292,11 +260,9 @@ def download_from_transfer_it(transfer_url, output_dir="./downloads"):
                 
                 restore_terminal_input()
                 
-                # Save the downloaded file to the specified location
                 console.print(f"[cyan]💾 Saving file to {output_path}...[/cyan]")
                 download.save_as(output_path)
                 
-                # Verify file exists
                 if os.path.exists(output_path):
                     file_size_mb = os.path.getsize(output_path) / (1024 * 1024)
                     show_download_success(output_path, file_name, file_size_mb, download_url)
@@ -310,11 +276,6 @@ def download_from_transfer_it(transfer_url, output_dir="./downloads"):
                 return None
             except Exception as e:
                 console.print(f"[red]❌ Error: {e}[/red]")
-                try:
-                    page.screenshot(path="transfer_it_error.png")
-                    console.print("[dim]Debug screenshot saved as transfer_it_error.png[/dim]")
-                except:
-                    pass
                 return None
             finally:
                 cleanup_browser()
@@ -367,7 +328,6 @@ def main():
     transfer_url = sys.argv[1]
     output_dir = sys.argv[2] if len(sys.argv) > 2 else "./downloads"
     
-    # Validate URL format
     if not transfer_url.startswith('http'):
         console.print("[red]❌ Error: Please provide a valid transfer.it URL[/red]")
         show_usage()
@@ -378,7 +338,6 @@ def main():
         console.print("[dim]Valid links look like: https://transfer.it/t/XXXXXXXXX[/dim]")
         sys.exit(1)
     
-    # Perform download
     result = download_from_transfer_it(transfer_url, output_dir)
     
     if result:

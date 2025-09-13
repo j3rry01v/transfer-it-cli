@@ -304,39 +304,63 @@ def upload_to_transfer_it(file_path):
                     
                     share_link = None
                     
-                    try:
-                        link_input = page.locator('input[readonly]').first
-                        if link_input.is_visible():
-                            share_link = link_input.input_value()
-                            if share_link and 'transfer.it/t/' in share_link:
-                                link_progress.update(link_task, description="✅ Link found!")
-                                return share_link
-                    except:
-                        pass
+                    link_selectors = [
+                        'input[type="text"]',
+                        'input[readonly]',
+                        'text=https://transfer.it/t/',
+                        '[data-clipboard-text*="transfer.it/t/"]',
+                        'input[value*="transfer.it/t/"]',
+                        '.link-input',
+                        '[data-clipboard-text]'
+                    ]
                     
-                    try:
-                        copy_link_button = page.locator('button.js-copy-link:not(.disabled)').first
-                        if copy_link_button.is_visible():
-                            copy_link_button.click()
-                            page.wait_for_timeout(1000)
-                        
-                        link_selectors = [
-                            'input[readonly]',
-                            '.link-input',
-                            '[data-clipboard-text]',
-                            'input[value*="transfer.it/t/"]'
-                        ]
-                        
-                        for selector in link_selectors:
-                            try:
+                    for selector in link_selectors:
+                        try:
+                            if selector.startswith('text='):
                                 elem = page.locator(selector).first
                                 if elem.is_visible():
-                                    link_value = elem.input_value() or elem.get_attribute('value') or elem.get_attribute('data-clipboard-text')
+                                    link_text = elem.text_content()
+                                    if link_text and 'transfer.it/t/' in link_text:
+                                        import re
+                                        match = re.search(r'https://transfer\.it/t/[a-zA-Z0-9]+', link_text)
+                                        if match:
+                                            share_link = match.group(0)
+                                            link_progress.update(link_task, description="✅ Link found in text!")
+                                            return share_link
+                            else:
+                                elem = page.locator(selector).first
+                                if elem.is_visible():
+                                    link_value = (elem.input_value() if elem.get_attribute('type') == 'text' or elem.get_attribute('readonly') is not None 
+                                                else elem.get_attribute('value') or elem.get_attribute('data-clipboard-text') or elem.text_content())
+                                    
                                     if link_value and 'transfer.it/t/' in link_value:
-                                        link_progress.update(link_task, description="✅ Link extracted!")
-                                        return link_value
-                            except:
-                                continue
+                                        import re
+                                        match = re.search(r'https://transfer\.it/t/[a-zA-Z0-9]+', link_value)
+                                        if match:
+                                            share_link = match.group(0)
+                                            link_progress.update(link_task, description="✅ Link extracted!")
+                                            return share_link
+                        except Exception as e:
+                            continue
+                    
+                    try:
+                        copy_button = page.locator('button:has-text("Copy")').first
+                        if copy_button.is_visible():
+                            copy_button.click()
+                            page.wait_for_timeout(1000)
+                            
+                            for selector in ['[data-clipboard-text]', 'input[readonly]', 'input[type="text"]']:
+                                try:
+                                    elem = page.locator(selector).first
+                                    if elem.is_visible():
+                                        link_value = elem.get_attribute('data-clipboard-text') or elem.input_value()
+                                        if link_value and 'transfer.it/t/' in link_value:
+                                            link_progress.update(link_task, description="✅ Link copied!")
+                                            return link_value
+                                except:
+                                    continue
+                    except:
+                        pass
                         
                         def handle_page(new_page):
                             nonlocal share_link
