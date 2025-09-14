@@ -305,8 +305,10 @@ def upload_to_transfer_it(file_path):
                     share_link = None
                     
                     link_selectors = [
-                        'input[type="text"]',
+                        'input[name="lrb-link"]',
+                        'input[type="text"][readonly]',
                         'input[readonly]',
+                        'input[type="text"]',
                         'text=https://transfer.it/t/',
                         '[data-clipboard-text*="transfer.it/t/"]',
                         'input[value*="transfer.it/t/"]',
@@ -344,9 +346,53 @@ def upload_to_transfer_it(file_path):
                             continue
                     
                     try:
-                        copy_button = page.locator('button:has-text("Copy")').first
-                        if copy_button.is_visible():
-                            copy_button.click()
+                        # First, click the "Copy link" button in the "Completed!" modal
+                        copy_button_modal = page.locator('button.js-copy-link').first
+                        if copy_button_modal.is_visible():
+                            link_progress.update(link_task, description="🔗 Clicking Copy link...")
+                            copy_button_modal.click()
+                            
+                            # Wait for the page to transition to "Your link is ready!" section
+                            page.wait_for_selector('.js-link-ready-section:not(.hidden)', timeout=10000)
+                            page.wait_for_timeout(2000)
+                            
+                            # After clicking, the link might be available in various places
+                            post_copy_selectors = [
+                                '[data-clipboard-text]',
+                                'input[readonly]', 
+                                'input[type="text"]',
+                                'input[value*="transfer.it/t/"]',
+                                # Check if a new page or element appears with the link
+                                'text=https://transfer.it/t/',
+                                '.link-input'
+                            ]
+                            
+                            for selector in post_copy_selectors:
+                                try:
+                                    if selector.startswith('text='):
+                                        elem = page.locator(selector).first
+                                        if elem.is_visible():
+                                            link_text = elem.text_content()
+                                            if link_text and 'transfer.it/t/' in link_text:
+                                                import re
+                                                match = re.search(r'https://transfer\.it/t/[a-zA-Z0-9]+', link_text)
+                                                if match:
+                                                    link_progress.update(link_task, description="✅ Link found after copy!")
+                                                    return match.group(0)
+                                    else:
+                                        elem = page.locator(selector).first
+                                        if elem.is_visible():
+                                            link_value = elem.get_attribute('data-clipboard-text') or elem.input_value() or elem.get_attribute('value')
+                                            if link_value and 'transfer.it/t/' in link_value:
+                                                link_progress.update(link_task, description="✅ Link extracted from clipboard!")
+                                                return link_value
+                                except:
+                                    continue
+                        
+                        # Also try the generic "Copy" button
+                        copy_button_generic = page.locator('button:has-text("Copy")').first
+                        if copy_button_generic.is_visible():
+                            copy_button_generic.click()
                             page.wait_for_timeout(1000)
                             
                             for selector in ['[data-clipboard-text]', 'input[readonly]', 'input[type="text"]']:
@@ -361,27 +407,28 @@ def upload_to_transfer_it(file_path):
                                     continue
                     except:
                         pass
-                        
-                        def handle_page(new_page):
-                            nonlocal share_link
-                            try:
-                                new_page.wait_for_load_state()
-                                share_link = new_page.url
-                                new_page.close()
-                            except:
-                                pass
-                        
+                    
+                    def handle_page(new_page):
+                        nonlocal share_link
+                        try:
+                            new_page.wait_for_load_state()
+                            share_link = new_page.url
+                            new_page.close()
+                        except:
+                            pass
+                    
+                    try:
                         context.on("page", handle_page)
                         
                         open_link_button = page.locator('button.js-show-content:has-text("Open link")')
                         if open_link_button.is_visible():
                             open_link_button.click()
                             page.wait_for_timeout(3000)
-                        
-                        if share_link and 'transfer.it/t/' in share_link:
-                            link_progress.update(link_task, description="✅ Link captured!")
-                            return share_link
                             
+                            if share_link and 'transfer.it/t/' in share_link:
+                                link_progress.update(link_task, description="✅ Link captured!")
+                                return share_link
+                                
                     except Exception as e:
                         console.print(f"[yellow]⚠️ Error getting share link: {e}[/yellow]")
                     
