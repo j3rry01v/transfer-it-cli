@@ -1,122 +1,93 @@
-# Transfer.it CLI Uploader
+# Transfer.it CLI
 
-A modern, colorful command-line tool to upload files to transfer.it with beautiful terminal UI and real-time progress tracking.
+Modern command-line tools for uploading and downloading files from transfer.it with beautiful terminal UI and real-time progress tracking.
 
-## Features
+## 🚀 Features
 
-- 🎨 **Beautiful Terminal UI** - Colorful progress bars, styled tables, and modern interface
-- 📊 **Real-time Progress Tracking** - Live upload progress with speed and ETA display
-- 📁 **File Information Display** - Elegant file details with size and path
-- 🔗 **Automatic Share Link Generation** - Clickable links in terminal
-- ⚡ **Smart Size Parsing** - Supports GB, MB, KB with accurate progress calculation
-- 🛡️ **Robust Error Handling** - Visual error indicators with debug screenshots
-- 🌍 **Cross-platform Support** - Works on macOS, Linux, and Windows
-- ⏱️ **Upload Timeout Protection** - 5-minute timeout to prevent hanging
+- **Beautiful Terminal UI** - Colorful progress bars and modern interface
+- **Real-time Progress** - Live upload/download progress with speed and ETA
+- **Unlimited File Sizes** - No arbitrary limits, handles GB+ files
+- **Fast Downloads** - aria2c integration for multi-connection downloads
+- **Smart Link Extraction** - Robust handling of transfer.it page changes
+- **Cross-platform** - Works on macOS, Linux, and Windows
 
-## Installation
+## 📦 Installation
 
-1. Clone this repository:
 ```bash
-git clone https://github.com/yourusername/transfer-it-uploader.git
-cd transfer-it-uploader
-```
-
-2. Create a virtual environment:
-```bash
-python3 -m venv .venv
-source .venv/bin/activate  # On Windows: .venv\Scripts\activate
-```
-
-3. Install dependencies:
-```bash
+git clone https://github.com/j3rry01v/transfer-it-cli.git
+cd transfer-it-cli
 pip install -r requirements.txt
 playwright install chromium
 ```
 
-## Usage
-
+### Optional: Install aria2c for faster downloads
 ```bash
-python3 transfer-it-uploader.py /path/to/your/file
+# macOS
+brew install aria2
+
+# Ubuntu/Debian
+sudo apt-get install aria2
+
+# Windows
+# Download from https://aria2.github.io/
 ```
 
-### Example
+## 🔧 Usage
 
+### Upload Files
 ```bash
-python3 transfer-it-uploader.py ~/Downloads/document.pdf
+python transfer-it-uploader.py /path/to/file.zip
 ```
 
-### What You'll See
-
-The tool provides a beautiful, modern interface with:
-
-- 📁 **File Information Panel** - Shows file name, size, and path in a styled table
-- 🚀 **Initialization Progress** - Spinner showing browser startup and page loading
-- 📤 **Upload Progress Bar** - Real-time progress with:
-  - Current uploaded size vs total size
-  - Upload speed (MB/s)
-  - ETA in H:M:S format
-  - Visual progress bar with percentage
-- 🎉 **Success Display** - Elegant results panel with clickable share link
-
-### Sample Output
-
-```
-🚀 Transfer.it CLI Uploader
-
-┌─────────────────── 📁 File Information ───────────────────┐
-│ Property  │ Value                                         │
-│ File Name │ document.pdf                                  │
-│ File Size │ 15.30 MB                                      │
-│ File Path │ /Users/username/Downloads/document.pdf        │
-└───────────────────────────────────────────────────────────┘
-
-🚀 Starting upload...
-⠋ 📤 8.45 MB / 15.30 MB • 2.1 MB/s ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━  55% ETA: 0:00:03
-
-🎉 SUCCESS! Your file has been uploaded successfully!
-┌─────────────────────────────────────────────────────────────┐
-│ 📁 File       │ document.pdf                                │
-│ 🔗 Share Link │ https://transfer.it/t/abc123def456          │
-│ 📋 Status     │ ✅ Ready to share                           │
-└─────────────────────────────────────────────────────────────┘
+### Download Files
+```bash
+python transfer-it-downloader.py https://transfer.it/t/abc123def456
 ```
 
-## Requirements
+## 📋 Requirements
 
 - Python 3.7+
-- Playwright (for browser automation)
-- Rich (for beautiful terminal UI)
-- Chromium browser (installed via Playwright)
+- playwright >= 1.40.0
+- rich >= 13.0.0
+- aria2c (optional, for faster downloads)
 
-## How it Works
+## 🎯 Examples
 
-This tool uses Playwright to automate a Chromium browser and interact with the transfer.it web interface. It:
+**Upload a large file:**
+```bash
+python transfer-it-uploader.py ~/Movies/large-video.mkv
+```
 
-1. Navigates to transfer.it
-2. Selects and uploads your file
-3. Monitors the upload progress
-4. Captures the generated share link
-5. Returns the link for sharing
+**Download with aria2c:**
+```bash
+python transfer-it-downloader.py https://transfer.it/t/xyz789
+```
 
-## Error Handling
+## 🛠️ How It Works
 
-The tool includes comprehensive error handling with visual feedback:
+**Uploader:**
+- Uses Playwright to automate transfer.it interface
+- Monitors real upload progress from webpage
+- Extracts share links with multiple fallback methods
+- No file size limits - supports unlimited uploads
 
-- ❌ **Clear Error Messages** - Color-coded error display with emojis
-- 📸 **Debug Screenshots** - Automatic screenshots saved for troubleshooting
-- ⏱️ **Timeout Protection** - 5-minute upload timeout prevents hanging
-- 🔄 **Fallback Methods** - Multiple approaches for link extraction
-- 🎯 **Specific Error Types** - Different handling for file not found, upload failures, etc.
+**Downloader:**
+- Extracts direct download URLs from transfer.it
+- Uses aria2c for fast, multi-connection downloads
+- Falls back to Playwright if aria2c unavailable
+- Real-time progress monitoring
 
-### Debug Files
+## 🔧 Troubleshooting
 
-- `transfer_it_error.png` - Screenshot when general errors occur
-- `transfer_it_debug.png` - Screenshot when link extraction fails
+**aria2c not found:**
+Install aria2c using your package manager (see installation section)
 
-## License
+**Upload stuck:**
+The tool automatically handles stalled uploads and browser cleanup
 
-MIT License - feel free to use and modify as needed.
+**Link extraction failed:**
+Debug screenshots are saved automatically for troubleshooting
 
-## Contributing
+## 📄 License
 
-Pull requests are welcome! Please feel free to submit issues or improvements.
+MIT License
