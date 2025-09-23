@@ -71,9 +71,9 @@ def kill_aria2c_processes():
         
         # Method 3: Platform specific
         if sys.platform == "darwin":
-            subprocess.run(['killall', 'aria2c'], capture_output=True, stderr=subprocess.DEVNULL)
+            subprocess.run(['killall', 'aria2c'], capture_output=True)
         elif sys.platform.startswith('linux'):
-            subprocess.run(['killall', 'aria2c'], capture_output=True, stderr=subprocess.DEVNULL)
+            subprocess.run(['killall', 'aria2c'], capture_output=True)
             
     except Exception as e:
         console.print(f"[yellow]Warning: Could not kill aria2c processes: {e}[/yellow]")
@@ -553,7 +553,10 @@ def download_from_transfer_it(transfer_url, output_dir="./downloads"):
                 browser_instance.close()
                 browser_instance = None
                 
-                # Download using aria2c
+                # End the progress context before starting aria2c
+                progress.remove_task(init_task)
+                
+                # Download using aria2c (outside the Progress context)
                 success = download_with_aria2c(download_url, output_path, file_name, expected_size_bytes)
                 
                 if success and os.path.exists(output_path):
