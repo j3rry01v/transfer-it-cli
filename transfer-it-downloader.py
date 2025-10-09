@@ -4,11 +4,10 @@ import time
 import signal
 import atexit
 import termios
-import tty
 import subprocess
-import threading
-import psutil 
+import shutil
 from pathlib import Path
+from urllib.parse import unquote
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeRemainingColumn, DownloadColumn, TransferSpeedColumn
@@ -47,7 +46,7 @@ def restore_terminal_input():
 def kill_aria2c_processes():
     """Kill all aria2c processes"""
     try:
-        # Method 1: Using psutil (reliable)
+        # Method 1: Using psutil (most reliable)
         try:
             import psutil
             for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
@@ -87,7 +86,7 @@ def cleanup_partial_download():
             console.print(f"[yellow]🗑️  Removing partial download ({file_size_mb:.2f} MB): {download_file_path}[/yellow]")
             os.remove(download_file_path)
             
-            # Also remove aria2 control file if exists, Make this optional in future update via congif
+            # Also remove aria2 control file if exists
             control_file = f"{download_file_path}.aria2"
             if os.path.exists(control_file):
                 os.remove(control_file)
@@ -97,13 +96,7 @@ def cleanup_partial_download():
 
 def check_aria2c():
     """Check if aria2c is installed"""
-    try:
-        result = subprocess.run(['aria2c', '--version'], capture_output=True, text=True)
-        if result.returncode == 0:
-            return True
-    except FileNotFoundError:
-        pass
-    return False
+    return shutil.which("aria2c") is not None
 
 def install_aria2c():
     """Provide instructions to install aria2c"""
@@ -181,11 +174,11 @@ def full_cleanup(remove_partial=True):
     # Kill any remaining aria2c processes
     kill_aria2c_processes()
     
-    # Clean up partial downloads if requested - check line 90
+    # Clean up partial downloads if requested
     if remove_partial:
         cleanup_partial_download()
     
-    # Close brwsr
+    # Close browser
     if browser_instance:
         try:
             browser_instance.close()
@@ -193,7 +186,7 @@ def full_cleanup(remove_partial=True):
             pass
         browser_instance = None
     
-    # Kill brwser process
+    # Kill browser processes
     kill_existing_browsers(show_message=False)
 
 def signal_handler(signum, frame):
@@ -263,6 +256,15 @@ def find_download_button(page):
         except:
             continue
     
+    # Fallback to role-based selector
+    try:
+        btn = page.get_by_role("button", name="Download all", exact=True)
+        if btn.is_visible():
+            console.print("[green]✅ Download button found[/green]")
+            return btn
+    except:
+        pass
+    
     return None
 
 def parse_aria2c_output(line):
@@ -273,11 +275,10 @@ def parse_aria2c_output(line):
             parts = line.strip().split()
             for part in parts:
                 if '/' in part and ('MiB' in part or 'GiB' in part or 'KiB' in part):
-                    # find downloaded/total
+                    # Find downloaded/total
                     downloaded_str = part.split('/')[0].replace('[#', '').replace('[', '')
                     total_str = part.split('/')[1].split('(')[0]
                     
-                
                     def to_bytes(size_str):
                         if 'GiB' in size_str:
                             return float(size_str.replace('GiB', '')) * 1024 * 1024 * 1024
@@ -291,14 +292,14 @@ def parse_aria2c_output(line):
                     downloaded = to_bytes(downloaded_str)
                     total = to_bytes(total_str)
                     
-                    # find speed
+                    # Find speed
                     speed = 0
                     for p in parts:
                         if p.startswith('DL:'):
                             speed_str = p.replace('DL:', '')
                             speed = to_bytes(speed_str)
                     
-                    # find ETA
+                    # Find ETA
                     eta = ""
                     for p in parts:
                         if p.startswith('ETA:'):
@@ -324,7 +325,7 @@ def download_with_aria2c(download_url, output_path, file_name, expected_size_byt
     console.print(f"[dim]Output: {output_path}[/dim]")
     console.print(f"[dim]Press Ctrl+C to cancel download and cleanup[/dim]\n")
     
-    # aria2c command 
+    # aria2c command with all optimizations
     cmd = [
         'aria2c',
         '--user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -334,9 +335,9 @@ def download_with_aria2c(download_url, output_path, file_name, expected_size_byt
         '--max-connection-per-server=16',
         '--split=16',
         '--min-split-size=1M',
-        '--console-log-level=error', 
+        '--console-log-level=error',
         '--file-allocation=none',
-        '--summary-interval=1', 
+        '--summary-interval=1',
         '--max-tries=5',
         '--retry-wait=5',
         '--timeout=60',
@@ -352,7 +353,7 @@ def download_with_aria2c(download_url, output_path, file_name, expected_size_byt
     ]
     
     try:
-        # Start aria2c 
+        # Start aria2c process
         aria2c_process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
@@ -361,7 +362,7 @@ def download_with_aria2c(download_url, output_path, file_name, expected_size_byt
             bufsize=1
         )
         
-        #  progress bar
+        # Create progress bar
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
@@ -413,8 +414,9 @@ def download_with_aria2c(download_url, output_path, file_name, expected_size_byt
             # Wait for process to complete
             aria2c_process.wait()
             
-            if aria2c_process.returncode == 0 and download_completed:
-                progress.update(task, completed=expected_size_bytes if expected_size_bytes > 0 else 100)
+            if aria2c_process.returncode == 0 or download_completed:
+                if expected_size_bytes > 0:
+                    progress.update(task, completed=expected_size_bytes)
                 console.print(f"\n[green]✅ Download completed successfully![/green]")
                 download_file_path = None  # Clear so it won't be deleted
                 return True
@@ -430,7 +432,7 @@ def download_with_aria2c(download_url, output_path, file_name, expected_size_byt
                 aria2c_process.wait(timeout=3)
             except subprocess.TimeoutExpired:
                 aria2c_process.kill()
-        raise  # Re raise to trigger cleanup
+        raise  # Re-raise to trigger cleanup
     except Exception as e:
         console.print(f"\n[red]❌ Error during download: {e}[/red]")
         if aria2c_process:
@@ -438,6 +440,78 @@ def download_with_aria2c(download_url, output_path, file_name, expected_size_byt
         return False
     finally:
         aria2c_process = None
+
+def get_download_info(url: str):
+    """
+    Automates capturing the download URL, original filename, and the descriptive title.
+    Returns: A tuple (download_url, original_filename, descriptive_title, file_info), or None on failure.
+    """
+    global browser_instance
+    
+    with sync_playwright() as p:
+        browser_instance = p.chromium.launch(
+            headless=True,
+            args=['--disable-blink-features=AutomationControlled']
+        )
+        page = browser_instance.new_page()
+        
+        try:
+            console.print(f"[cyan]🌐 Navigating to {url}...[/cyan]")
+            page.goto(url, timeout=60000, wait_until="domcontentloaded")
+            
+            # Check for cookie banner
+            try:
+                console.print("[dim]Checking for cookie banner...[/dim]")
+                accept_button = page.get_by_role("button", name="Accept all")
+                accept_button.click(timeout=10000)
+                console.print("[dim]Cookie banner accepted.[/dim]")
+            except PlaywrightTimeout:
+                console.print("[dim]Cookie banner not found, continuing...[/dim]")
+            
+            # Wait for page to stabilize
+            page.wait_for_timeout(3000)
+            
+            # Extract file information
+            file_info = extract_file_info(page)
+            
+            # Find and click download button
+            download_button = find_download_button(page)
+            
+            if not download_button:
+                console.print("[red]❌ Download button not found[/red]")
+                return None
+            
+            console.print("[cyan]🖱️ Clicking download button...[/cyan]")
+            console.print("[cyan]⏳ Waiting for download to start...[/cyan]")
+            
+            with page.expect_download(timeout=30000) as download_info:
+                download_button.click()
+            
+            download = download_info.value
+            download_url = download.url
+            original_filename = unquote(download_url.split('/')[-1].split('?')[0])
+            
+            console.print(f"[green]✅ Download URL obtained![/green]")
+            
+            # Cancel the download as we'll use aria2c
+            download.cancel()
+            
+            # Get descriptive title
+            descriptive_title = file_info.get('name', '')
+            
+            return download_url, original_filename, descriptive_title, file_info
+            
+        except PlaywrightTimeout as e:
+            console.print(f"[red]❌ Timeout error: {e}[/red]")
+            return None
+        except Exception as e:
+            console.print(f"[red]❌ An error occurred: {e}[/red]")
+            return None
+        finally:
+            console.print("[dim]Closing browser.[/dim]")
+            if browser_instance:
+                browser_instance.close()
+                browser_instance = None
 
 def download_from_transfer_it(transfer_url, output_dir="./downloads"):
     """Main function to download from transfer.it"""
@@ -447,7 +521,7 @@ def download_from_transfer_it(transfer_url, output_dir="./downloads"):
         console.print("[red]❌ Invalid transfer.it URL[/red]")
         return None
     
-    # Check if aria2c installed
+    # Check if aria2c is installed
     if not check_aria2c():
         install_aria2c()
     
@@ -461,125 +535,64 @@ def download_from_transfer_it(transfer_url, output_dir="./downloads"):
     show_transfer_info(transfer_url)
     kill_existing_browsers(show_message=True)
     
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        console=console,
-        transient=True
-    ) as progress:
-        init_task = progress.add_task("🚀 Initializing browser...", total=None)
-        
-        with sync_playwright() as p:
-            global browser_instance
-            browser_instance = p.chromium.launch(
-                headless=True,
-                args=['--disable-blink-features=AutomationControlled']
-            )
-            browser = browser_instance
-            context = browser.new_context(
-                viewport={'width': 1280, 'height': 720},
-                user_agent='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                accept_downloads=True
-            )
-            page = context.new_page()
-            
-            try:
-                progress.update(init_task, description="🌐 Opening transfer.it link...")
-                page.goto(transfer_url, wait_until="networkidle", timeout=30000)
-                
-                progress.update(init_task, description="⏳ Waiting for page to load...")
-                page.wait_for_timeout(3000)
-                
-                file_info = extract_file_info(page)
-                
-                progress.update(init_task, description="🔍 Looking for download button...")
-                download_button = find_download_button(page)
-                
-                if not download_button:
-                    console.print("[red]❌ Download button not found[/red]")
-                    return None
-                
-                progress.update(init_task, description="🎯 Getting download URL...")
-                console.print("[cyan]🖱️ Clicking download button...[/cyan]")
-                
-                # Get download URL
-                with page.expect_download(timeout=30000) as download_info:
-                    download_button.click()
-                    console.print("[cyan]⏳ Waiting for download to start...[/cyan]")
-                
-                download = download_info.value
-                progress.remove_task(init_task)
-                
-                # Get dl URL and file info
-                download_url = download.url
-                file_name = file_info.get('name', download.suggested_filename)
-                
-                # Handle "Multiple files" case - usually a zip 
-                if file_name == "Multiple files":
-                    file_name = download.suggested_filename
-                    if not file_name.endswith('.zip'):
-                        file_name = f"{file_name}.zip"
-                
-                console.print(f"[green]✅ Download URL obtained![/green]")
-                console.print(f"[cyan]📄 Filename: {file_name}[/cyan]")
-                console.print("[cyan]🔗 Direct URL:[/cyan]")
-                console.print(f"[bright_blue]{download_url}[/bright_blue]")
-                
-                # Calculate expected size
-                expected_size_bytes = 0
-                try:
-                    size_text = file_info.get('size', '')
-                    if 'GB' in size_text:
-                        size_gb = float(size_text.replace('GB', '').strip())
-                        expected_size_bytes = int(size_gb * 1024 * 1024 * 1024)
-                    elif 'MB' in size_text:
-                        size_mb = float(size_text.replace('MB', '').strip())
-                        expected_size_bytes = int(size_mb * 1024 * 1024)
-                    elif 'KB' in size_text:
-                        size_kb = float(size_text.replace('KB', '').strip())
-                        expected_size_bytes = int(size_kb * 1024)
-                except:
-                    expected_size_bytes = 0
-                
-                # Cancel Playwright download since using aria2c
-                download.cancel()
-                
-                # Create out directory
-                os.makedirs(output_dir, exist_ok=True)
-                output_path = os.path.join(output_dir, file_name)
-                download_file_path = output_path
-                
-                # Close browser before starting download
-                browser_instance.close()
-                browser_instance = None
-                
-                # End the progress context before starting aria2c
-                progress.remove_task(init_task)
-                
-                # Download using aria2c (outside the Progress context)
-                success = download_with_aria2c(download_url, output_path, file_name, expected_size_bytes)
-                
-                if success and os.path.exists(output_path):
-                    file_size_mb = os.path.getsize(output_path) / (1024 * 1024)
-                    show_download_success(output_path, file_name, file_size_mb, download_url)
-                    download_file_path = None  # Clear so it won't be deleted on exit
-                    return output_path
-                else:
-                    console.print("[red]❌ File download failed[/red]")
-                    return None
-                    
-            except PlaywrightTimeout:
-                console.print("[red]❌ Timeout while getting download URL[/red]")
-                return None
-            except KeyboardInterrupt:
-                raise  # Let signal handler deal with it
-            except Exception as e:
-                console.print(f"[red]❌ Error: {e}[/red]")
-                return None
-            finally:
-                if browser_instance:
-                    browser_instance.close()
-                    browser_instance = None
+    # Get download info
+    download_info = get_download_info(transfer_url)
+    
+    if not download_info:
+        console.print("[red]❌ Could not retrieve download information from the URL.[/red]")
+        return None
+    
+    download_url, original_filename, descriptive_title, file_info = download_info
+    
+    # Determine final filename
+    if descriptive_title and descriptive_title != "Multiple files":
+        sanitized_title = descriptive_title.replace('/', '-').replace('\\', '-').replace(':', ' -')
+        if original_filename.endswith('.zip'):
+            file_name = f"{sanitized_title}.zip"
+        else:
+            file_name = sanitized_title
+    else:
+        file_name = original_filename
+        # Handle "Multiple files" case - usually a zip
+        if descriptive_title == "Multiple files" and not file_name.endswith('.zip'):
+            file_name = f"{file_name}.zip"
+    
+    console.print(f"[cyan]📄 Final Filename: {file_name}[/cyan]")
+    console.print("[cyan]🔗 Direct URL:[/cyan]")
+    console.print(f"[bright_blue]{download_url}[/bright_blue]")
+    
+    # Calculate expected size
+    expected_size_bytes = 0
+    try:
+        size_text = file_info.get('size', '')
+        if 'GB' in size_text:
+            size_gb = float(size_text.replace('GB', '').strip())
+            expected_size_bytes = int(size_gb * 1024 * 1024 * 1024)
+        elif 'MB' in size_text:
+            size_mb = float(size_text.replace('MB', '').strip())
+            expected_size_bytes = int(size_mb * 1024 * 1024)
+        elif 'KB' in size_text:
+            size_kb = float(size_text.replace('KB', '').strip())
+            expected_size_bytes = int(size_kb * 1024)
+    except:
+        expected_size_bytes = 0
+    
+    # Create output directory
+    os.makedirs(output_dir, exist_ok=True)
+    output_path = os.path.join(output_dir, file_name)
+    download_file_path = output_path
+    
+    # Download with aria2c
+    success = download_with_aria2c(download_url, output_path, file_name, expected_size_bytes)
+    
+    if success and os.path.exists(output_path):
+        file_size_mb = os.path.getsize(output_path) / (1024 * 1024)
+        show_download_success(output_path, file_name, file_size_mb, download_url)
+        download_file_path = None  # Clear so it won't be deleted on exit
+        return output_path
+    else:
+        console.print("[red]❌ File download failed[/red]")
+        return None
 
 def show_download_success(file_path, file_name, file_size_mb, download_url):
     """Display success message with file information"""
@@ -611,8 +624,8 @@ def show_usage():
         "[bold cyan]Transfer.it CLI Downloader (with aria2c)[/bold cyan]\n\n"
         "[yellow]Usage:[/yellow] python3 transfer-it-downloader.py <transfer_url> [output_directory]\n\n"
         "[yellow]Examples:[/yellow]\n"
-        "  python3 transfer-it-downloader.py https://transfer.it/t/Zg1eX5g1WLJS\n"
-        "  python3 transfer-it-downloader.py https://transfer.it/t/Zg1eX5g1WLJS ./my-downloads\n\n"
+        "  python3 transfer-it-downloader.py https://transfer.it/t/abc123def456\n"
+        "  python3 transfer-it-downloader.py https://transfer.it/t/abc123def456 ./my-downloads\n\n"
         "[yellow]Requirements:[/yellow]\n"
         "  • aria2c must be installed on your system\n"
         "  • playwright (pip install playwright)\n"
@@ -657,6 +670,8 @@ def main():
         pass
     except Exception as e:
         console.print(f"\n[red]❌ Unexpected error: {e}[/red]")
+        import traceback
+        traceback.print_exc()
         full_cleanup(remove_partial=True)
         sys.exit(1)
 
