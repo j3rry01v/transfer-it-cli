@@ -1,4 +1,7 @@
 
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 import sys
 import os
 import time
@@ -15,9 +18,17 @@ from rich.text import Text
 from rich.table import Table
 from rich import box
 
-console = Console()
+# Detect if running in a server environment
+IS_SERVER = not sys.stdout.isatty() or os.getenv('SSH_CONNECTION') or os.getenv('SSH_CLIENT')
+
+if IS_SERVER:
+    # Rich console optimized for server environments
+    console = Console(force_terminal=True, width=80)
+else:
+    console = Console()
 browser_instance = None
 original_terminal_settings = None
+display_conflict_detected = False
 
 def setup_terminal_for_progress():
     """Configure terminal to allow Ctrl+C while minimizing interference"""
@@ -118,23 +129,302 @@ signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 atexit.register(cleanup_browser)
 
-def show_file_info(file_path):
+def show_file_info_simple(file_path):
+    """Simple file info display without Rich UI"""
     file_name = os.path.basename(file_path)
     file_size = os.path.getsize(file_path)
     file_size_mb = file_size / (1024 * 1024)
     
-    table = Table(box=box.ROUNDED)
-    table.add_column("Property", style="cyan", no_wrap=True)
-    table.add_column("Value", style="magenta")
+    print("📁 File Information")
+    print("=" * 50)
+    print(f"File Name: {file_name}")
+    print(f"File Size: {file_size_mb:.2f} MB")
+    print(f"File Path: {file_path}")
+    print("=" * 50)
     
-    table.add_row("File Name", file_name)
-    table.add_row("File Size", f"{file_size_mb:.2f} MB")
-    table.add_row("File Path", file_path)
-    
-    console.print(Panel(table, title="📁 File Information", border_style="blue"))
     return file_name, file_size_mb
 
+def show_file_info(file_path):
+    """Rich file info display with fallback to simple mode"""
+    global display_conflict_detected
+    
+    if display_conflict_detected:
+        # Already detected conflict, use simple mode directly
+        return show_file_info_simple(file_path)
+    
+    try:
+        file_name = os.path.basename(file_path)
+        file_size = os.path.getsize(file_path)
+        file_size_mb = file_size / (1024 * 1024)
+        
+        table = Table(box=box.ROUNDED)
+        table.add_column("Property", style="cyan", no_wrap=True)
+        table.add_column("Value", style="magenta")
+        
+        table.add_row("File Name", file_name)
+        table.add_row("File Size", f"{file_size_mb:.2f} MB")
+        table.add_row("File Path", file_path)
+        
+        console.print(Panel(table, title="📁 File Information", border_style="blue"))
+        return file_name, file_size_mb
+    except Exception as e:
+        error_msg = str(e).lower()
+        if "only one live display may be active at once" in error_msg or "display" in error_msg:
+            display_conflict_detected = True
+            print("\n" + "="*60)
+            print("⚠️  DISPLAY CONFLICT DETECTED")
+            print("="*60)
+            print("The Rich UI is conflicting with your terminal environment.")
+            print("This can happen when:")
+            print("• Multiple terminal sessions are active")
+            print("• Running inside screen/tmux with complex display setup")
+            print("• Terminal doesn't fully support Rich's display management")
+            print()
+            print("🔄 Automatically switching to simple mode...")
+            print("="*60)
+            print()
+            # Fall back to simple display
+            return show_file_info_simple(file_path)
+        else:
+            # Re-raise other errors
+            raise e
+
+def upload_to_transfer_it_simple(file_path):
+    """Simple upload function without Rich UI - for server environments"""
+    if not os.path.exists(file_path):
+        print(f"Error: File not found: {file_path}")
+        return None
+    
+    file_name = os.path.basename(file_path)
+    file_size = os.path.getsize(file_path)
+    file_size_mb = file_size / (1024 * 1024)
+    
+    print(f"Uploading {file_name} ({file_size_mb:.2f} MB)...")
+    
+    with sync_playwright() as p:
+        # Launch browser with server friendly settings
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                '--disable-blink-features=AutomationControlled',
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-accelerated-2d-canvas',
+                '--no-first-run',
+                '--no-zygote',
+                '--single-process',
+                '--disable-gpu',
+                '--disable-background-timer-throttling',
+                '--disable-backgrounding-occluded-windows',
+                '--disable-renderer-backgrounding',
+                '--disable-extensions',
+                '--disable-plugins'
+            ]
+        )
+        context = browser.new_context(
+            viewport={'width': 1280, 'height': 720},
+            user_agent='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        )
+        page = context.new_page()
+        
+        try:
+            print("Opening transfer.it...")
+            page.goto("https://transfer.it", wait_until="domcontentloaded")
+            
+            print("Waiting for page to load...")
+            page.wait_for_timeout(5000)
+            
+            print("Selecting file...")
+            file_input = page.locator('input[type="file"][name="select-file"]').first
+            file_input.set_input_files(file_path)
+            
+            page.wait_for_timeout(2000)
+            
+            print("Clicking Transfer button...")
+            transfer_button = page.locator('button.js-get-link-button:has-text("Transfer")')
+            
+            page.wait_for_function(
+                """() => {
+                    const btn = document.querySelector('button.js-get-link-button');
+                    return btn && !btn.classList.contains('disabled');
+                }""",
+                timeout=10000
+            )
+            
+            transfer_button.click()
+            
+            print("Starting upload...")
+            
+            page.wait_for_selector('.js-transfer-section:not(.hidden)', timeout=5000)
+            
+            # Monitor progress until completion
+            last_progress = ""
+            start_time = time.time()
+            
+            while True:
+                try:
+                    completed_section = page.locator('section.transferring-box.completed')
+                    if completed_section.count() > 0:
+                        print("\nUpload completed!")
+                        break
+
+                    if page.locator('h4:has-text("Completed!")').is_visible():
+                        print("\nUpload completed!")
+                        break
+                    
+                    # Get progress information
+                    uploaded_elem = page.locator('.status-info.transfer span.uploaded').first
+                    size_elem = page.locator('.status-info.transfer span.size').first
+                    speed_elem = page.locator('.status-info.transfer span.speed').first
+                    time_elem = page.locator('.status-info.time span.left').first
+                    
+                    if uploaded_elem.is_visible():
+                        uploaded = uploaded_elem.text_content()
+                        total_size = size_elem.text_content()
+                        speed = speed_elem.text_content()
+                        time_left = time_elem.text_content()
+                        
+                        # Create progress string
+                        progress_str = f"Progress: {uploaded} / {total_size} | Speed: {speed} | ETA: {time_left}"
+                        
+                        # Only print if progress changed
+                        if progress_str != last_progress:
+                            print(f"\r{progress_str}", end='', flush=True)
+                            last_progress = progress_str
+                    
+                except:
+                    # If we can't read progress, just wait
+                    pass
+                
+                # Small delay to avoid too frequent checks
+                page.wait_for_timeout(1000)
+                
+                # Timeout after 30 minutes
+                if time.time() - start_time > 1800:
+                    print("\nUpload timeout - taking too long")
+                    return None
+            
+            print("\nGetting share link...")
+            page.wait_for_timeout(2000)
+            
+            # Try to find the share link in various ways
+            share_link = None
+            
+            # Method 1: Look for input fields with the link
+            link_selectors = [
+                'input[name="lrb-link"]',
+                'input[type="text"][readonly]',
+                'input[readonly]',
+                'input[type="text"]',
+                'input[value*="transfer.it/t/"]'
+            ]
+            
+            for selector in link_selectors:
+                try:
+                    elem = page.locator(selector).first
+                    if elem.is_visible():
+                        link_value = elem.input_value() or elem.get_attribute('value')
+                        if link_value and 'transfer.it/t/' in link_value:
+                            share_link = link_value
+                            break
+                except:
+                    continue
+            
+            # Method 2: Click copy button and try to capture link
+            if not share_link:
+                try:
+                    copy_link_button = page.locator('button.js-copy-link:not(.disabled)').first
+                    if copy_link_button.is_visible():
+                        copy_link_button.click()
+                        page.wait_for_timeout(2000)
+                        
+                        # Try again to find the link after clicking copy
+                        for selector in link_selectors:
+                            try:
+                                elem = page.locator(selector).first
+                                if elem.is_visible():
+                                    link_value = elem.input_value() or elem.get_attribute('value')
+                                    if link_value and 'transfer.it/t/' in link_value:
+                                        share_link = link_value
+                                        break
+                            except:
+                                continue
+                except:
+                    pass
+            
+            # Method 3: Try opening link in new tab
+            if not share_link:
+                try:
+                    def handle_page(new_page):
+                        nonlocal share_link
+                        new_page.wait_for_load_state()
+                        share_link = new_page.url
+                        new_page.close()
+                    
+                    context.on("page", handle_page)
+                    
+                    open_link_button = page.locator('button.js-show-content:has-text("Open link")')
+                    if open_link_button.is_visible():
+                        open_link_button.click()
+                        page.wait_for_timeout(3000)
+                        
+                        if share_link and 'transfer.it/t/' in share_link:
+                            return share_link
+                except:
+                    pass
+            
+            if share_link and 'transfer.it/t/' in share_link:
+                return share_link
+            else:
+                print("Could not capture share link")
+                page.screenshot(path="transfer_it_error.png")
+                return None
+            
+        except Exception as e:
+            print(f"\nError: {e}")
+            try:
+                page.screenshot(path="transfer_it_error.png")
+                print("Screenshot saved as transfer_it_error.png")
+            except:
+                pass
+            return None
+            
+        finally:
+            browser.close()
+
 def upload_to_transfer_it(file_path):
+    """Upload with Rich UI - falls back to simple mode if display conflicts occur"""
+    global display_conflict_detected
+    
+    if display_conflict_detected:
+        # Already detected conflict, use simple mode directly
+        return upload_to_transfer_it_simple(file_path)
+    
+    try:
+        return _upload_to_transfer_it_rich(file_path)
+    except Exception as e:
+        error_msg = str(e).lower()
+        if "only one live display may be active at once" in error_msg or "display" in error_msg:
+            display_conflict_detected = True
+            print("\n" + "="*60)
+            print("⚠️  DISPLAY CONFLICT DETECTED")
+            print("="*60)
+            print("The Rich UI is conflicting with your terminal environment.")
+            print("This can happen when:")
+            print("• Multiple terminal sessions are active")
+            print("• Running inside screen/tmux with complex display setup")
+            print("• Terminal doesn't fully support Rich's display management")
+            print()
+            print("🔄 Automatically switching to simple mode...")
+            print("="*60)
+            print()
+            return upload_to_transfer_it_simple(file_path)
+        else:
+            # Re raise other errors
+            raise e
+
+def _upload_to_transfer_it_rich(file_path):
     if not os.path.exists(file_path):
         console.print(f"[red]❌ Error: File not found: {file_path}[/red]")
         return None
@@ -156,7 +446,22 @@ def upload_to_transfer_it(file_path):
             global browser_instance
             browser_instance = p.chromium.launch(
                 headless=True,
-                args=['--disable-blink-features=AutomationControlled']
+                args=[
+                    '--disable-blink-features=AutomationControlled',
+                    '--no-sandbox',
+                    '--disable-setuid-sandbox',
+                    '--disable-dev-shm-usage',
+                    '--disable-accelerated-2d-canvas',
+                    '--no-first-run',
+                    '--no-zygote',
+                    '--single-process',
+                    '--disable-gpu',
+                    '--disable-background-timer-throttling',
+                    '--disable-backgrounding-occluded-windows',
+                    '--disable-renderer-backgrounding',
+                    '--disable-extensions',
+                    '--disable-plugins'
+                ]
             )
             browser = browser_instance
             context = browser.new_context(
@@ -438,6 +743,11 @@ def upload_to_transfer_it(file_path):
                     return None
             
             except Exception as e:
+                error_msg = str(e).lower()
+                # Re-raise display conflicts so the wrapper can handle them
+                if "only one live display may be active at once" in error_msg or "display" in error_msg:
+                    raise e
+                
                 console.print(f"[red]❌ Error: {e}[/red]")
                 try:
                     page.screenshot(path="transfer_it_error.png")
@@ -453,9 +763,12 @@ def upload_to_transfer_it(file_path):
 def show_usage():
     console.print(Panel.fit(
         "[bold cyan]Transfer.it CLI Uploader[/bold cyan]\n\n"
-        "[yellow]Usage:[/yellow] python3 transfer-it-uploader.py <file_path>\n\n"
-        "[yellow]Example:[/yellow]\n"
-        "  python3 transfer-it-uploader.py /path/to/your/file.mp3",
+        "[yellow]Usage:[/yellow] python3 transfer-it-uploader.py [--simple] <file_path>\n\n"
+        "[yellow]Options:[/yellow]\n"
+        "  --simple    Use simple text output (recommended for servers/tmux)\n\n"
+        "[yellow]Examples:[/yellow]\n"
+        "  python3 transfer-it-uploader.py /path/to/your/file.mp3\n"
+        "  python3 transfer-it-uploader.py --simple /path/to/your/file.mp3",
         border_style="blue"
     ))
 
@@ -481,25 +794,100 @@ def show_success(share_link, file_name):
     ))
 
 def main():
-    console.print("\n[bold magenta]🚀 Transfer.it CLI Uploader[/bold magenta]\n")
+    global display_conflict_detected
     
-    if len(sys.argv) < 2:
-        show_usage()
+    # Check for simple mode flag (now only enabled explicitly since Rich works on servers)
+    simple_mode = '--simple' in sys.argv
+    
+    # Try to show title with Rich, fall back to simple if display conflict
+    if simple_mode:
+        print("Transfer.it CLI Uploader")
+    else:
+        try:
+            console.print("\n[bold magenta]🚀 Transfer.it CLI Uploader[/bold magenta]\n")
+        except Exception as e:
+            error_msg = str(e).lower()
+            if "only one live display may be active at once" in error_msg or "display" in error_msg:
+                display_conflict_detected = True
+                print("\n" + "="*60)
+                print("⚠️  DISPLAY CONFLICT DETECTED")
+                print("="*60)
+                print("The Rich UI is conflicting with your terminal environment.")
+                print("This can happen when:")
+                print("• Multiple terminal sessions are active")
+                print("• Running inside screen/tmux with complex display setup")
+                print("• Terminal doesn't fully support Rich's display management")
+                print()
+                print("🔄 Automatically switching to simple mode...")
+                print("="*60)
+                print()
+                print("Transfer.it CLI Uploader")
+                simple_mode = True  # Force simple mode for the rest of the session
+            else:
+                raise e
+    
+    # Filter out flags from arguments
+    file_args = [arg for arg in sys.argv[1:] if not arg.startswith('--')]
+    
+    if len(file_args) < 1:
+        if simple_mode or display_conflict_detected:
+            print("Usage: python3 transfer-it-uploader.py [--simple] <file_path>")
+            print("Options:")
+            print("  --simple    Use simple text output (optional)")
+            print("Example: python3 transfer-it-uploader.py /path/to/file.mp3")
+        else:
+            try:
+                show_usage()
+            except Exception as e:
+                error_msg = str(e).lower()
+                if "only one live display may be active at once" in error_msg or "display" in error_msg:
+                    print("Usage: python3 transfer-it-uploader.py [--simple] <file_path>")
+                    print("Options:")
+                    print("  --simple    Use simple text output (recommended for your environment)")
+                    print("Example: python3 transfer-it-uploader.py /path/to/file.mp3")
+                else:
+                    raise e
         sys.exit(1)
     
-    file_path = sys.argv[1]
+    file_path = file_args[0]
     
     if not os.path.exists(file_path):
-        console.print(f"[red]❌ Error: File not found: {file_path}[/red]")
+        if simple_mode or display_conflict_detected:
+            print(f"Error: File not found: {file_path}")
+        else:
+            try:
+                console.print(f"[red]❌ Error: File not found: {file_path}[/red]")
+            except Exception as e:
+                error_msg = str(e).lower()
+                if "only one live display may be active at once" in error_msg or "display" in error_msg:
+                    print(f"Error: File not found: {file_path}")
+                else:
+                    raise e
         sys.exit(1)
     
-    share_link = upload_to_transfer_it(file_path)
-    
-    if share_link:
-        show_success(share_link, os.path.basename(file_path))
+    # Choose upload method based on mode
+    if simple_mode:
+        share_link = upload_to_transfer_it_simple(file_path)
+        
+        if share_link:
+            print("\n" + "="*50)
+            print("SUCCESS!")
+            print("="*50)
+            print(f"Your file has been uploaded successfully.")
+            print(f"Share link: {share_link}")
+        else:
+            print("\nUpload failed. Please try again.")
+            sys.exit(1)
     else:
-        console.print("\n[red]❌ Upload failed. Please try again.[/red]")
-        sys.exit(1)
+        share_link = upload_to_transfer_it(file_path)
+        
+        if share_link:
+            show_success(share_link, os.path.basename(file_path))
+        else:
+            console.print("\n[red]❌ Upload failed. Please try again.[/red]")
+            console.print("\n[yellow]💡 If you continue having issues, try:[/yellow]")
+            console.print("[dim]   python3 transfer-it-uploader.py --simple <file_path>[/dim]")
+            sys.exit(1)
 
 if __name__ == "__main__":
     main()
