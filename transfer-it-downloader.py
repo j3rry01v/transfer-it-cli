@@ -453,7 +453,13 @@ def get_download_info(url: str):
             headless=True,
             args=['--disable-blink-features=AutomationControlled']
         )
-        page = browser_instance.new_page()
+        context = browser_instance.new_context(
+            locale='en-US',
+            extra_http_headers={
+                'Accept-Language': 'en-US,en;q=0.9'
+            }
+        )
+        page = context.new_page()
         
         try:
             console.print(f"[cyan]🌐 Navigating to {url}...[/cyan]")

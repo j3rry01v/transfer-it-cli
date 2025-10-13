@@ -224,7 +224,11 @@ def upload_to_transfer_it_simple(file_path):
         )
         context = browser.new_context(
             viewport={'width': 1280, 'height': 720},
-            user_agent='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            user_agent='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            locale='en-US',
+            extra_http_headers={
+                'Accept-Language': 'en-US,en;q=0.9'
+            }
         )
         page = context.new_page()
         
@@ -466,7 +470,11 @@ def _upload_to_transfer_it_rich(file_path):
             browser = browser_instance
             context = browser.new_context(
                 viewport={'width': 1280, 'height': 720},
-                user_agent='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                user_agent='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                locale='en-US',
+                extra_http_headers={
+                    'Accept-Language': 'en-US,en;q=0.9'
+                }
             )
             page = context.new_page()
             
