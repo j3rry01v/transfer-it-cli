@@ -543,7 +543,7 @@ def download_from_transfer_it_mega(transfer_url, output_dir, password=None, forc
             aria2c_enabled = False
 
     if simple_mode:
-        state = {"single": False, "current": None}
+        state = {"single": False, "current": None, "file_started": time.monotonic()}
 
         def on_start(files, total):
             state["single"] = len(files) == 1
@@ -552,15 +552,28 @@ def download_from_transfer_it_mega(transfer_url, output_dir, password=None, forc
 
         def on_file_start(node, out_path):
             state["current"] = node
+            state["file_started"] = time.monotonic()
             if not state["single"]:
                 print(f"Starting: {node.name or node.handle}")
 
         def on_file_progress(node, done, total):
+            elapsed = max(time.monotonic() - state["file_started"], 0.001)
+            speed = done / elapsed
             percent = (done / total * 100) if total else 0
-            print(f"\rProgress: {humanise_bytes(done)} / {humanise_bytes(total)} ({percent:.1f}%)", end="", flush=True)
+            print(
+                f"\rProgress: {humanise_bytes(done)} / {humanise_bytes(total)} "
+                f"({percent:.1f}%) | Speed: {humanise_bytes(speed)}/s",
+                end="",
+                flush=True,
+            )
 
         def on_file_done(node, out_path):
-            print(f"\rProgress: {humanise_bytes(node.size)} / {humanise_bytes(node.size)} (100.0%)")
+            elapsed = max(time.monotonic() - state["file_started"], 0.001)
+            speed = (node.size or 0) / elapsed
+            print(
+                f"\rProgress: {humanise_bytes(node.size)} / {humanise_bytes(node.size)} "
+                f"(100.0%) | Speed: {humanise_bytes(speed)}/s"
+            )
             print(f"Saved: {out_path}")
 
         def on_skip(node, out_path):

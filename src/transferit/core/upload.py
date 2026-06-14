@@ -989,11 +989,19 @@ def upload_to_transfer_it_mega(path, simple_mode=False, upload_kwargs=None, quie
 
     if simple_mode:
         print(f"Uploading with MEGA backend: {p}")
+        started = time.monotonic()
 
         def on_progress(sent, total):
             arm_mega_upload_stall_alarm()
+            elapsed = max(time.monotonic() - started, 0.001)
+            speed = sent / elapsed
             percent = (sent / total * 100) if total else 0
-            print(f"\rProgress: {humanise_bytes(sent)} / {humanise_bytes(total)} ({percent:.1f}%)", end="", flush=True)
+            print(
+                f"\rProgress: {humanise_bytes(sent)} / {humanise_bytes(total)} "
+                f"({percent:.1f}%) | Speed: {humanise_bytes(speed)}/s",
+                end="",
+                flush=True,
+            )
 
         previous_handler = signal.getsignal(signal.SIGALRM) if hasattr(signal, "SIGALRM") else None
         if hasattr(signal, "SIGALRM"):
