@@ -10,13 +10,34 @@ import atexit
 import termios
 import tty
 import subprocess
-from playwright.sync_api import sync_playwright
+import argparse
+from pathlib import Path
 from rich.console import Console
-from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeRemainingColumn
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeRemainingColumn, DownloadColumn, TransferSpeedColumn
 from rich.panel import Panel
 from rich.text import Text
 from rich.table import Table
 from rich import box
+
+from ..cli_common import humanise_duration, parse_expiry, parse_schedule, print_json
+from ..config import load_config, prompt_yes_no, resolve_upload_backend
+
+try:
+    from playwright.sync_api import sync_playwright
+except ImportError:
+    sync_playwright = None
+
+try:
+    from ..mega.client import Transferit
+except ImportError:
+    Transferit = None
+
+def reexec_with_packaged_python_if_available():
+    current = os.path.realpath(sys.executable)
+    for candidate in ("/usr/local/bin/python3", "/opt/homebrew/bin/python3"):
+        if os.path.exists(candidate) and os.path.realpath(candidate) != current:
+            os.execv(candidate, [candidate] + sys.argv)
+    return False
 
 # Detect if running in a server environment
 IS_SERVER = not sys.stdout.isatty() or os.getenv('SSH_CONNECTION') or os.getenv('SSH_CLIENT')
@@ -29,6 +50,23 @@ else:
 browser_instance = None
 original_terminal_settings = None
 display_conflict_detected = False
+MEGA_UPLOAD_STALL_TIMEOUT = int(os.environ.get("TRANSFER_IT_MEGA_UPLOAD_STALL_TIMEOUT", "180"))
+
+class MegaUploadStalled(TimeoutError):
+    pass
+
+def arm_mega_upload_stall_alarm():
+    if hasattr(signal, "SIGALRM"):
+        signal.alarm(MEGA_UPLOAD_STALL_TIMEOUT)
+
+def clear_mega_upload_stall_alarm(previous_handler=None):
+    if hasattr(signal, "SIGALRM"):
+        signal.alarm(0)
+        if previous_handler is not None:
+            signal.signal(signal.SIGALRM, previous_handler)
+
+def mega_upload_stall_handler(signum, frame):
+    raise MegaUploadStalled(f"MEGA upload stalled for {MEGA_UPLOAD_STALL_TIMEOUT} seconds without progress")
 
 def setup_terminal_for_progress():
     """Configure terminal to allow Ctrl+C while minimizing interference"""
@@ -191,6 +229,11 @@ def show_file_info(file_path):
 
 def upload_to_transfer_it_simple(file_path):
     """Simple upload function without Rich UI - for server environments"""
+    if sync_playwright is None:
+        reexec_with_packaged_python_if_available()
+        print("Error: Playwright is not installed. Run: python3 -m pip install -r requirements.txt")
+        return None
+
     if not os.path.exists(file_path):
         print(f"Error: File not found: {file_path}")
         return None
@@ -200,6 +243,7 @@ def upload_to_transfer_it_simple(file_path):
     file_size_mb = file_size / (1024 * 1024)
     
     print(f"Uploading {file_name} ({file_size_mb:.2f} MB)...")
+    print("Using browser upload session...")
     
     with sync_playwright() as p:
         # Launch browser with server friendly settings
@@ -429,11 +473,17 @@ def upload_to_transfer_it(file_path):
             raise e
 
 def _upload_to_transfer_it_rich(file_path):
+    if sync_playwright is None:
+        reexec_with_packaged_python_if_available()
+        console.print("[red]❌ Playwright is not installed. Run: python3 -m pip install -r requirements.txt[/red]")
+        return None
+
     if not os.path.exists(file_path):
         console.print(f"[red]❌ Error: File not found: {file_path}[/red]")
         return None
     
     file_name, file_size_mb = show_file_info(file_path)
+    console.print("[cyan]🌐 Using browser upload session[/cyan]")
 
     kill_existing_browsers(show_message=True)
     
@@ -444,7 +494,7 @@ def _upload_to_transfer_it_rich(file_path):
         transient=True
     ) as progress:
         
-        init_task = progress.add_task("🚀 Initializing browser...", total=None)
+        init_task = progress.add_task("🌐 Starting browser upload session...", total=None)
         
         with sync_playwright() as p:
             global browser_instance
@@ -771,12 +821,15 @@ def _upload_to_transfer_it_rich(file_path):
 def show_usage():
     console.print(Panel.fit(
         "[bold cyan]Transfer.it CLI Uploader[/bold cyan]\n\n"
-        "[yellow]Usage:[/yellow] python3 transfer-it-uploader.py [--simple] <file_path>\n\n"
+        "[yellow]Usage:[/yellow] transferit upload [options] <file_or_folder>\n\n"
         "[yellow]Options:[/yellow]\n"
-        "  --simple    Use simple text output (recommended for servers/tmux)\n\n"
+        "  --backend mega|browser   Upload backend (default: mega)\n"
+        "  --simple                 Use simple text output (recommended for servers/tmux)\n"
+        "  --no-fallback            Do not ask to retry with browser mode\n\n"
         "[yellow]Examples:[/yellow]\n"
-        "  python3 transfer-it-uploader.py /path/to/your/file.mp3\n"
-        "  python3 transfer-it-uploader.py --simple /path/to/your/file.mp3",
+        "  transferit upload /path/to/your/file.mp3\n"
+        "  transferit upload /path/to/folder\n"
+        "  transferit upload --backend browser /path/to/your/file.mp3",
         border_style="blue"
     ))
 
@@ -801,18 +854,322 @@ def show_success(share_link, file_name):
         padding=(1, 2)
     ))
 
-def main():
-    global display_conflict_detected
-    
-    # Check for simple mode flag (now only enabled explicitly since Rich works on servers)
-    simple_mode = '--simple' in sys.argv
-    
-    # Try to show title with Rich, fall back to simple if display conflict
+def humanise_bytes(num_bytes):
+    units = ["B", "KB", "MB", "GB", "TB"]
+    value = float(num_bytes)
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            return f"{value:.2f} {unit}" if unit != "B" else f"{int(value)} B"
+        value /= 1024
+
+def build_upload_kwargs(args):
+    try:
+        expiry = parse_expiry(args.expiry)
+        schedule = parse_schedule(args.schedule)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+    recipients = list(args.recipients or []) or None
+    if schedule is not None and not recipients:
+        raise argparse.ArgumentTypeError("--schedule requires at least one --recipient")
+
+    return {
+        "title": args.title,
+        "message": args.message,
+        "password": args.password,
+        "sender": args.sender,
+        "expiry": expiry,
+        "notify_expiry": args.notify_expiry,
+        "max_downloads": args.max_downloads,
+        "recipients": recipients,
+        "schedule": schedule,
+        "concurrency": args.concurrency,
+        "parallel": args.parallel,
+        "exclude": list(args.excludes or []) or None,
+    }
+
+def has_mega_only_upload_options(args):
+    return any([
+        args.title,
+        args.message,
+        args.password,
+        args.sender,
+        args.expiry,
+        args.notify_expiry,
+        args.max_downloads,
+        args.recipients,
+        args.schedule,
+        args.excludes,
+        args.concurrency != 8,
+        args.parallel is not None,
+        args.json,
+    ])
+
+def show_mega_upload_summary(result, source, elapsed, kwargs):
+    size = result.total_bytes
+    rate = (size / elapsed / 1e6) if elapsed else 0
+    table = Table.grid(padding=(0, 2))
+    table.add_column(style="dim", justify="right")
+    table.add_column(overflow="fold")
+    table.add_row("title", f"[bold]{result.title}[/bold]")
+    table.add_row("source", str(source))
+    table.add_row(
+        "content",
+        f"{result.file_count} file{'s' if result.file_count != 1 else ''}"
+        + (f", {result.folder_count} folder(s)" if result.folder_count else ""),
+    )
+    table.add_row("size", f"{humanise_bytes(size)} [dim]({size:,} bytes)[/dim]")
+    table.add_row("elapsed", f"{elapsed:.1f}s [dim]({rate:.2f} MB/s)[/dim]")
+    if kwargs.get("sender"):
+        table.add_row("sender", kwargs["sender"])
+    if kwargs.get("expiry"):
+        table.add_row("expiry", f"{humanise_duration(kwargs['expiry'])} [dim]({kwargs['expiry']}s)[/dim]")
+    if kwargs.get("password"):
+        table.add_row("password", "[green]set[/green]")
+    if kwargs.get("message"):
+        message = kwargs["message"]
+        table.add_row("message", message if len(message) < 60 else message[:57] + "...")
+    if kwargs.get("max_downloads"):
+        table.add_row("max downloads", str(kwargs["max_downloads"]))
+    if kwargs.get("recipients"):
+        table.add_row("recipients", ", ".join(kwargs["recipients"]))
+        if kwargs.get("schedule") is not None:
+            table.add_row("scheduled", time.strftime("%Y-%m-%d %H:%M:%S %Z", time.localtime(kwargs["schedule"])))
+    table.add_row("share", f"[link={result.url}]{result.url}[/link]")
+    console.print(Panel(table, title="transfer.it", title_align="right", border_style="green", box=box.ROUNDED))
+
+def show_path_info(path):
+    p = Path(path).expanduser().resolve()
+    if p.is_file():
+        table = Table(box=box.ROUNDED)
+        table.add_column("Property", style="cyan", no_wrap=True)
+        table.add_column("Value", style="magenta")
+        table.add_row("Type", "File")
+        table.add_row("Name", p.name)
+        table.add_row("Size", humanise_bytes(p.stat().st_size))
+        table.add_row("Path", str(p))
+        console.print(Panel(table, title="📁 Upload Information", border_style="blue"))
+        return
+
+    file_count = 0
+    folder_count = 0
+    total = 0
+    for root, dirs, files in os.walk(p):
+        folder_count += len(dirs)
+        for name in files:
+            fp = Path(root) / name
+            if fp.is_file():
+                file_count += 1
+                total += fp.stat().st_size
+
+    table = Table(box=box.ROUNDED)
+    table.add_column("Property", style="cyan", no_wrap=True)
+    table.add_column("Value", style="magenta")
+    table.add_row("Type", "Folder")
+    table.add_row("Name", p.name)
+    table.add_row("Files", str(file_count))
+    table.add_row("Folders", str(folder_count))
+    table.add_row("Total Size", humanise_bytes(total))
+    table.add_row("Path", str(p))
+    console.print(Panel(table, title="📁 Upload Information", border_style="blue"))
+
+def upload_to_transfer_it_mega(path, simple_mode=False, upload_kwargs=None, quiet=False):
+    upload_kwargs = upload_kwargs or {}
+    if Transferit is None:
+        reexec_with_packaged_python_if_available()
+        raise RuntimeError("MEGA backend dependencies are missing. Run: python3 -m pip install -r requirements.txt")
+
+    p = Path(path).expanduser().resolve()
+    if not p.exists():
+        raise FileNotFoundError(f"Path not found: {p}")
+
+    if quiet:
+        with Transferit() as tx:
+            return tx.upload(p, **upload_kwargs)
+
     if simple_mode:
-        print("Transfer.it CLI Uploader")
-    else:
+        print(f"Uploading with MEGA backend: {p}")
+
+        def on_progress(sent, total):
+            arm_mega_upload_stall_alarm()
+            percent = (sent / total * 100) if total else 0
+            print(f"\rProgress: {humanise_bytes(sent)} / {humanise_bytes(total)} ({percent:.1f}%)", end="", flush=True)
+
+        previous_handler = signal.getsignal(signal.SIGALRM) if hasattr(signal, "SIGALRM") else None
+        if hasattr(signal, "SIGALRM"):
+            signal.signal(signal.SIGALRM, mega_upload_stall_handler)
+        arm_mega_upload_stall_alarm()
         try:
-            console.print("\n[bold magenta]🚀 Transfer.it CLI Uploader[/bold magenta]\n")
+            with Transferit() as tx:
+                result = tx.upload(p, on_progress=on_progress, **upload_kwargs)
+        finally:
+            clear_mega_upload_stall_alarm(previous_handler)
+        print()
+        return result
+
+    show_path_info(p)
+    console.print("[cyan]⚡ Using MEGA backend[/cyan]")
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        TextColumn("•"),
+        DownloadColumn(),
+        TextColumn("•"),
+        TransferSpeedColumn(),
+        TextColumn("•"),
+        TimeRemainingColumn(),
+        console=console,
+        refresh_per_second=2,
+    ) as progress:
+        task_id = progress.add_task(f"📤 Uploading {p.name}", total=1)
+
+        def on_start(total_bytes, file_count):
+            arm_mega_upload_stall_alarm()
+            label = f"📤 Uploading {file_count} file(s) from {p.name}"
+            progress.update(task_id, description=label, total=total_bytes or 1)
+
+        active_tasks = {}
+
+        def on_file_start(idx, file_path, fsize):
+            if not p.is_dir():
+                return
+            try:
+                label = file_path.relative_to(p).as_posix()
+            except ValueError:
+                label = file_path.name
+            active_tasks[idx] = progress.add_task(f"[dim]{label}[/dim]", total=fsize or 1)
+
+        def on_file_progress(idx, file_path, sent, fsize):
+            tid = active_tasks.get(idx)
+            if tid is not None:
+                progress.update(tid, completed=sent, total=fsize or 1)
+
+        def on_file_done(idx, file_path, fsize):
+            tid = active_tasks.pop(idx, None)
+            if tid is not None:
+                progress.update(tid, completed=fsize or 1, total=fsize or 1)
+                progress.remove_task(tid)
+
+        def on_progress(sent, total):
+            arm_mega_upload_stall_alarm()
+            progress.update(task_id, completed=sent, total=total or 1)
+
+        previous_handler = signal.getsignal(signal.SIGALRM) if hasattr(signal, "SIGALRM") else None
+        if hasattr(signal, "SIGALRM"):
+            signal.signal(signal.SIGALRM, mega_upload_stall_handler)
+        arm_mega_upload_stall_alarm()
+        try:
+            with Transferit() as tx:
+                result = tx.upload(
+                    p,
+                    on_start=on_start,
+                    on_progress=on_progress,
+                    on_file_start=on_file_start if p.is_dir() else None,
+                    on_file_progress=on_file_progress if p.is_dir() else None,
+                    on_file_done=on_file_done if p.is_dir() else None,
+                    **upload_kwargs,
+                )
+        finally:
+            clear_mega_upload_stall_alarm(previous_handler)
+
+        progress.update(task_id, completed=result.total_bytes or 1, total=result.total_bytes or 1, description="✅ Upload complete")
+
+    return result
+
+def upload_with_retries(path, attempts, simple_mode=False, upload_kwargs=None, quiet=False):
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        try:
+            if not simple_mode and not quiet:
+                console.print(f"[cyan]Upload attempt {attempt}/{attempts} using MEGA backend[/cyan]")
+            return upload_to_transfer_it_mega(path, simple_mode=simple_mode, upload_kwargs=upload_kwargs, quiet=quiet)
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:
+            last_error = exc
+            if simple_mode or quiet:
+                print(f"Upload attempt {attempt} failed on MEGA backend: {exc}")
+            else:
+                console.print(f"[yellow]⚠️ Upload attempt {attempt} failed on MEGA backend: {exc}[/yellow]")
+            if attempt < attempts:
+                time.sleep(min(2 * attempt, 10))
+    raise RuntimeError(f"MEGA upload failed after {attempts} attempt(s): {last_error}")
+
+def parse_args(argv):
+    parser = argparse.ArgumentParser(prog="transferit upload", description="Upload files or folders to transfer.it")
+    parser.add_argument("path", nargs="?", help="File or folder to upload")
+    parser.add_argument("--simple", action="store_true", help="Use simple text output")
+    parser.add_argument("--backend", choices=["mega", "browser"], help="Upload backend (default from config: mega)")
+    parser.add_argument("--no-fallback", action="store_true", help="Do not ask to retry with browser mode if MEGA fails")
+    parser.add_argument("-n", "--name", "--title", dest="title", help="Title shown on the transfer page")
+    parser.add_argument("-c", "--concurrency", type=int, default=8, help="Parallel connections per file in MEGA mode (default: 8)")
+    parser.add_argument("-j", "--parallel", type=int, help="Files uploaded at the same time in MEGA mode")
+    parser.add_argument("-m", "--message", help="Short note displayed on the transfer page")
+    parser.add_argument("-p", "--password", help="Require this password to open the transfer")
+    parser.add_argument("-s", "--sender", "--from", dest="sender", metavar="EMAIL", help="Sender email; required with password/message/expiry/recipient")
+    parser.add_argument("-e", "--expiry", metavar="DURATION", help="Transfer expiry duration, e.g. 30m, 2h, 7d, 1w, 1y")
+    notify = parser.add_mutually_exclusive_group()
+    notify.add_argument("--notify-expiry", dest="notify_expiry", action="store_true", help="Email sender before expiry")
+    notify.add_argument("--no-notify-expiry", dest="notify_expiry", action="store_false", help="Do not email sender before expiry")
+    parser.set_defaults(notify_expiry=False)
+    parser.add_argument("--max-downloads", type=int, metavar="N", help="Stop allowing downloads after N successful fetches")
+    parser.add_argument("-r", "--recipient", dest="recipients", action="append", metavar="EMAIL", help="Email this recipient the link; repeat for multiple")
+    parser.add_argument("--schedule", metavar="TIME", help="Delay recipient email until ISO 8601 time or Unix timestamp")
+    parser.add_argument("-x", "--exclude", dest="excludes", action="append", metavar="PATTERN", help="Skip folder files matching this glob; repeat for multiple")
+    parser.add_argument("--json", action="store_true", help="Print machine-readable JSON in MEGA mode")
+    return parser.parse_args(argv)
+
+def main(argv=None):
+    global display_conflict_detected
+
+    args = parse_args(sys.argv[1:] if argv is None else argv)
+    config = load_config()
+    simple_mode = args.simple
+    backend = resolve_upload_backend(args.backend, config)
+    retry_count = int(config.get("retry_count", 3))
+    try:
+        upload_kwargs = build_upload_kwargs(args)
+    except argparse.ArgumentTypeError as exc:
+        print(f"Error: {exc}") if simple_mode else console.print(f"[red]Error: {exc}[/red]")
+        sys.exit(2)
+
+    if args.concurrency < 1 or args.concurrency > 32:
+        print("Error: --concurrency must be between 1 and 32") if simple_mode else console.print("[red]Error: --concurrency must be between 1 and 32[/red]")
+        sys.exit(2)
+    if args.parallel is not None and (args.parallel < 1 or args.parallel > 16):
+        print("Error: --parallel must be between 1 and 16") if simple_mode else console.print("[red]Error: --parallel must be between 1 and 16[/red]")
+        sys.exit(2)
+    if args.max_downloads is not None and args.max_downloads < 1:
+        print("Error: --max-downloads must be at least 1") if simple_mode else console.print("[red]Error: --max-downloads must be at least 1[/red]")
+        sys.exit(2)
+
+    if backend == "browser" and has_mega_only_upload_options(args):
+        msg = "Browser upload does not support metadata/API options yet; use --backend mega for password, sender, expiry, recipients, exclude, concurrency, or --json."
+        print(msg) if simple_mode else console.print(f"[red]{msg}[/red]")
+        sys.exit(2)
+
+    if backend == "mega" and (args.password or args.message or args.expiry) and not args.sender:
+        hint = (
+            "Error: --password, --message, and --expiry require --sender EMAIL.\n\n"
+            "Example:\n"
+            "  transferit upload file.zip --password secret --sender you@example.com\n\n"
+            "The sender email is shown to recipients and is required by transfer.it\n"
+            "when setting transfer metadata. Never sent in plain text."
+        )
+        print(hint) if simple_mode else console.print(f"[red]{hint}[/red]")
+        sys.exit(2)
+
+    if (backend == "mega" and Transferit is None) or (backend == "browser" and sync_playwright is None):
+        reexec_with_packaged_python_if_available()
+
+    if simple_mode and not args.json:
+        print(f"transferit upload (backend={backend})")
+    elif not args.json:
+        try:
+            console.print(f"\n[bold magenta]transferit upload[/bold magenta] [dim]backend={backend}[/dim]\n")
         except Exception as e:
             error_msg = str(e).lower()
             if "only one live display may be active at once" in error_msg or "display" in error_msg:
@@ -829,73 +1186,109 @@ def main():
                 print("🔄 Automatically switching to simple mode...")
                 print("="*60)
                 print()
-                print("Transfer.it CLI Uploader")
+                print("transferit upload")
                 simple_mode = True  # Force simple mode for the rest of the session
             else:
                 raise e
-    
-    # Filter out flags from arguments
-    file_args = [arg for arg in sys.argv[1:] if not arg.startswith('--')]
-    
-    if len(file_args) < 1:
+
+    if not args.path:
         if simple_mode or display_conflict_detected:
-            print("Usage: python3 transfer-it-uploader.py [--simple] <file_path>")
+            print("Usage: transferit upload [--backend mega|browser] [--simple] <path>")
             print("Options:")
-            print("  --simple    Use simple text output (optional)")
-            print("Example: python3 transfer-it-uploader.py /path/to/file.mp3")
+            print("  --backend    Upload backend: mega (default) or browser")
+            print("  --simple     Use simple text output")
+            print("Example: transferit upload /path/to/file-or-folder")
         else:
             try:
                 show_usage()
             except Exception as e:
                 error_msg = str(e).lower()
                 if "only one live display may be active at once" in error_msg or "display" in error_msg:
-                    print("Usage: python3 transfer-it-uploader.py [--simple] <file_path>")
+                    print("Usage: transferit upload [--simple] <file_path>")
                     print("Options:")
                     print("  --simple    Use simple text output (recommended for your environment)")
-                    print("Example: python3 transfer-it-uploader.py /path/to/file.mp3")
+                    print("Example: transferit upload /path/to/file.mp3")
                 else:
                     raise e
         sys.exit(1)
-    
-    file_path = file_args[0]
-    
-    if not os.path.exists(file_path):
+
+    upload_path = args.path
+
+    if not os.path.exists(upload_path):
         if simple_mode or display_conflict_detected:
-            print(f"Error: File not found: {file_path}")
+            print(f"Error: Path not found: {upload_path}")
         else:
             try:
-                console.print(f"[red]❌ Error: File not found: {file_path}[/red]")
+                console.print(f"[red]❌ Error: Path not found: {upload_path}[/red]")
             except Exception as e:
                 error_msg = str(e).lower()
                 if "only one live display may be active at once" in error_msg or "display" in error_msg:
-                    print(f"Error: File not found: {file_path}")
+                    print(f"Error: Path not found: {upload_path}")
                 else:
                     raise e
         sys.exit(1)
-    
-    # Choose upload method based on mode
-    if simple_mode:
-        share_link = upload_to_transfer_it_simple(file_path)
-        
-        if share_link:
+
+    started = time.monotonic()
+    result = None
+    share_link = None
+    if backend == "mega":
+        try:
+            result = upload_with_retries(
+                upload_path,
+                retry_count,
+                simple_mode=simple_mode or display_conflict_detected,
+                upload_kwargs=upload_kwargs,
+                quiet=args.json,
+            )
+            share_link = result.url
+        except Exception as exc:
+            if simple_mode or display_conflict_detected:
+                print(f"MEGA backend failed: {exc}")
+            else:
+                console.print(f"[red]❌ MEGA backend failed: {exc}[/red]")
+
+            should_fallback = False
+            if not args.no_fallback and config.get("prompt_browser_fallback", True):
+                should_fallback = prompt_yes_no("MEGA backend failed. Retry using browser mode?", default=False)
+
+            if should_fallback:
+                if has_mega_only_upload_options(args):
+                    msg = "Browser fallback would drop MEGA upload metadata/options, so fallback was not used. Retry without those options or use --backend mega."
+                    print(msg) if simple_mode else console.print(f"[red]❌ {msg}[/red]")
+                    sys.exit(1)
+                if os.path.isdir(upload_path):
+                    msg = "Browser fallback supports file uploads only. Use MEGA backend for folder uploads."
+                    print(msg) if simple_mode else console.print(f"[red]❌ {msg}[/red]")
+                    sys.exit(1)
+                share_link = upload_to_transfer_it_simple(upload_path) if (simple_mode or display_conflict_detected) else upload_to_transfer_it(upload_path)
+            else:
+                sys.exit(1)
+    else:
+        if os.path.isdir(upload_path):
+            msg = "Browser backend supports file uploads only. Use --backend mega for folder uploads."
+            print(msg) if simple_mode else console.print(f"[red]❌ {msg}[/red]")
+            sys.exit(1)
+        share_link = upload_to_transfer_it_simple(upload_path) if (simple_mode or display_conflict_detected) else upload_to_transfer_it(upload_path)
+
+    if result is not None and args.json:
+        print_json(result.to_json_dict())
+    elif result is not None and not (simple_mode or display_conflict_detected):
+        show_mega_upload_summary(result, upload_path, time.monotonic() - started, upload_kwargs)
+    elif share_link:
+        if simple_mode or display_conflict_detected:
             print("\n" + "="*50)
             print("SUCCESS!")
             print("="*50)
-            print(f"Your file has been uploaded successfully.")
+            print("Your upload completed successfully.")
             print(f"Share link: {share_link}")
         else:
-            print("\nUpload failed. Please try again.")
-            sys.exit(1)
+            show_success(share_link, os.path.basename(upload_path.rstrip(os.sep)))
     else:
-        share_link = upload_to_transfer_it(file_path)
-        
-        if share_link:
-            show_success(share_link, os.path.basename(file_path))
+        if simple_mode or display_conflict_detected:
+            print("\nUpload failed. Please try again.")
         else:
             console.print("\n[red]❌ Upload failed. Please try again.[/red]")
-            console.print("\n[yellow]💡 If you continue having issues, try:[/yellow]")
-            console.print("[dim]   python3 transfer-it-uploader.py --simple <file_path>[/dim]")
-            sys.exit(1)
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()

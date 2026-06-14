@@ -1,93 +1,203 @@
-# Transfer.it CLI
+# transferit
 
-Modern command-line tools for uploading and downloading files from transfer.it with beautiful terminal UI and real-time progress tracking.
+A clean command-line client for transfer.it with a fast direct MEGA backend, browser fallback, Rich terminal UI, folder uploads, and optional aria2c acceleration for downloads.
 
-## 🚀 Features
+## Features
 
-- **Beautiful Terminal UI** - Colorful progress bars and modern interface
-- **Real-time Progress** - Live upload/download progress with speed and ETA
-- **Unlimited File Sizes** - No arbitrary limits, handles GB+ files
-- **Fast Downloads** - aria2c integration for multi-connection downloads
-- **Smart Link Extraction** - Robust handling of transfer.it page changes
-- **Cross-platform** - Works on macOS, Linux, and Windows
+- One command: `transferit`
+- Fast default MEGA backend with no browser required
+- Browser backend retained as fallback
+- File and folder uploads
+- Password, sender, message, expiry, max-download, recipient, schedule, exclude, concurrency, and JSON options for MEGA uploads
+- Transfer downloads with optional password support
+- Machine-readable JSON output for MEGA upload/download/info/metadata
+- Transfer metadata and file-tree inspection
+- Configurable retries and browser fallback prompt
+- Rich progress UI
+- Optional aria2c acceleration for MEGA and browser downloads
+- Persistent config stored in `~/.config/transfer-it-cli/config.json`
 
-## 📦 Installation
+## Install
+
+### From GitHub
+
+```bash
+pip install git+https://github.com/j3rry01v/transfer-it-cli.git
+```
+
+### Local development
 
 ```bash
 git clone https://github.com/j3rry01v/transfer-it-cli.git
 cd transfer-it-cli
-pip install -r requirements.txt
-playwright install chromium
+pip install -e .
 ```
 
-### Optional: Install aria2c for faster downloads
+### Browser fallback (optional)
+
+```bash
+python3 -m playwright install chromium
+```
+
+### aria2c for faster downloads (optional)
+
 ```bash
 # macOS
 brew install aria2
 
 # Ubuntu/Debian
 sudo apt-get install aria2
-
-# Windows
-# Download from https://aria2.github.io/
 ```
 
-## 🔧 Usage
+## Usage
 
-### Upload Files
+Upload a file or folder:
+
 ```bash
-python transfer-it-uploader.py /path/to/file.zip
+transferit upload /path/to/file.zip
+transferit upload /path/to/folder
 ```
 
-### Download Files
+Password-protect an upload:
+
 ```bash
-python transfer-it-downloader.py https://transfer.it/t/abc123def456
+transferit upload /path/to/file.zip --password "secret" --sender me@example.com
 ```
 
-## 📋 Requirements
+Add upload metadata and limits:
 
-- Python 3.7+
-- playwright >= 1.40.0
-- rich >= 13.0.0
-- aria2c (optional, for faster downloads)
-
-## 🎯 Examples
-
-**Upload a large file:**
 ```bash
-python transfer-it-uploader.py ~/Movies/large-video.mkv
+transferit upload ./project \
+  --title "Project files" \
+  --message "Latest build" \
+  --sender me@example.com \
+  --expiry 7d \
+  --max-downloads 5
 ```
 
-**Download with aria2c:**
+Email recipients, optionally scheduled:
+
 ```bash
-python transfer-it-downloader.py https://transfer.it/t/xyz789
+transferit upload big.mp4 \
+  --sender me@example.com \
+  --recipient alice@example.com \
+  --recipient bob@example.com \
+  --schedule 2026-04-25T09:00
 ```
 
-## 🛠️ How It Works
+Tune MEGA uploads or exclude folder content:
 
-**Uploader:**
-- Uses Playwright to automate transfer.it interface
-- Monitors real upload progress from webpage
-- Extracts share links with multiple fallback methods
-- No file size limits - supports unlimited uploads
+```bash
+transferit upload ./project --concurrency 8 --parallel 4 -x .git -x '__pycache__' -x '*.pyc'
+```
 
-**Downloader:**
-- Extracts direct download URLs from transfer.it
-- Uses aria2c for fast, multi-connection downloads
-- Falls back to Playwright if aria2c unavailable
-- Real-time progress monitoring
+JSON upload result:
 
-## 🔧 Troubleshooting
+```bash
+transferit upload --json /path/to/file.zip
+```
 
-**aria2c not found:**
-Install aria2c using your package manager (see installation section)
+Force a backend:
 
-**Upload stuck:**
-The tool automatically handles stalled uploads and browser cleanup
+```bash
+transferit upload --backend mega /path/to/file.zip
+transferit upload --backend browser /path/to/file.zip
+```
 
-**Link extraction failed:**
-Debug screenshots are saved automatically for troubleshooting
+Download a transfer:
 
-## 📄 License
+```bash
+transferit download "https://transfer.it/t/abc123def456"
+transferit download abc123def456
+```
 
-MIT License
+Download to a folder:
+
+```bash
+transferit download --output-dir ~/Downloads "https://transfer.it/t/abc123def456"
+```
+
+Password-protected transfer:
+
+```bash
+transferit download --password "secret" "https://transfer.it/t/abc123def456"
+```
+
+JSON download result:
+
+```bash
+transferit download --json abc123def456
+```
+
+Browser backend download with aria2c:
+
+```bash
+transferit download --backend browser --aria2c "https://transfer.it/t/abc123def456"
+```
+
+MEGA backend download with aria2c:
+
+```bash
+transferit download --aria2c "https://transfer.it/t/abc123def456"
+```
+
+Browser backend download without aria2c:
+
+```bash
+transferit download --backend browser --no-aria2c "https://transfer.it/t/abc123def456"
+```
+
+Show transfer info:
+
+```bash
+transferit info "https://transfer.it/t/abc123def456"
+transferit info --json abc123def456
+```
+
+Show only transfer metadata:
+
+```bash
+transferit metadata "https://transfer.it/t/abc123def456"
+transferit metadata --json abc123def456
+```
+
+Show version:
+
+```bash
+transferit --version
+```
+
+Configure defaults:
+
+```bash
+transferit config
+transferit config --show
+transferit config --reset
+```
+
+## Defaults
+
+```json
+{
+  "upload_backend": "mega",
+  "download_backend": "mega",
+  "aria2c_enabled": true,
+  "download_dir": "~/Downloads",
+  "retry_count": 3,
+  "prompt_browser_fallback": true
+}
+```
+
+## Backend Notes
+
+`mega` is the default. It talks directly to transfer.it's MEGA backend, uploads through WebSockets, downloads through streaming HTTP, and decrypts locally.
+
+`browser` uses Playwright automation and is kept as a fallback if the direct method stops working.
+
+`aria2c` can be enabled for both backends. In MEGA mode, aria2c downloads the encrypted blob to a temporary file and transferit decrypts it locally. In browser mode, aria2c downloads the direct URL extracted by Playwright.
+
+Browser upload currently supports simple file uploads only. MEGA-only upload options such as password, sender, message, expiry, recipients, schedule, exclude, concurrency, and JSON are intentionally rejected in browser mode so metadata is not silently dropped.
+
+## License And Attribution
+
+This project is MIT licensed. The direct MEGA backend is adapted from the MIT-licensed `transferit-py` project by Adnan Ahmad. See `THIRD_PARTY_NOTICES.md`.
