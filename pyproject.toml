@@ -1,6 +1,6 @@
 [project]
 name = "transfer-it-cli"
-version = "0.2.0"
+version = "0.2.1"
 description = "Transfer.it uploader/downloader with MEGA direct backend and browser fallback."
 readme = "README.md"
 requires-python = ">=3.9"

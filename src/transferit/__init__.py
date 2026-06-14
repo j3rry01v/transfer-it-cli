@@ -10,7 +10,7 @@ except ImportError:  # pragma: no cover
 try:
     __version__ = version("transfer-it-cli")
 except Exception:  # pragma: no cover - editable/source tree fallback
-    __version__ = "0.2.0"
+    __version__ = "0.2.1"
 
 try:
     from .mega.api import MegaAPI, MegaAPIError

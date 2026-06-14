@@ -111,6 +111,12 @@ transferit download "https://transfer.it/t/abc123def456"
 transferit download abc123def456
 ```
 
+Use simple text output on servers, SSH sessions, or tmux:
+
+```bash
+transferit download --simple "https://transfer.it/t/abc123def456"
+```
+
 Download to a folder:
 
 ```bash

@@ -508,7 +508,7 @@ def humanise_bytes(num_bytes):
             return f"{value:.2f} {unit}" if unit != "B" else f"{int(value)} B"
         value /= 1024
 
-def download_from_transfer_it_mega(transfer_url, output_dir, password=None, force=False, quiet=False, aria2c_enabled=True):
+def download_from_transfer_it_mega(transfer_url, output_dir, password=None, force=False, quiet=False, simple_mode=False, aria2c_enabled=True):
     if Transferit is None:
         reexec_with_packaged_python_if_available()
         raise RuntimeError("MEGA backend dependencies are missing. Run: python3 -m pip install -r requirements.txt")
@@ -519,20 +519,66 @@ def download_from_transfer_it_mega(transfer_url, output_dir, password=None, forc
         with Transferit() as tx:
             return tx.download(transfer_url, output_root, password=password, force=force, aria2c=aria2c_enabled)
 
-    console.print(f"[cyan]⚡ Using MEGA backend[/cyan]")
-    console.print(f"[dim]Output directory: {output_root}[/dim]")
+    if simple_mode:
+        print(f"Downloading with MEGA backend: {transfer_url}")
+        print(f"Output directory: {output_root}")
+    else:
+        console.print(f"[cyan]⚡ Using MEGA backend[/cyan]")
+        console.print(f"[dim]Output directory: {output_root}[/dim]")
     if aria2c_enabled:
         if shutil.which("aria2c"):
-            console.print("[cyan]aria2c enabled for encrypted blob download + local decryption[/cyan]")
+            if simple_mode:
+                print("aria2c enabled for encrypted blob download + local decryption")
+            else:
+                console.print("[cyan]aria2c enabled for encrypted blob download + local decryption[/cyan]")
         else:
-            console.print(
-                "[yellow]aria2c not found.[/yellow] Install for faster downloads:\n"
+            msg = (
+                "aria2c not found. Install for faster downloads:\n"
                 "  macOS:    brew install aria2\n"
                 "  Ubuntu:   sudo apt-get install aria2\n"
                 "  Fedora:   sudo dnf install aria2\n"
-                "[yellow]Continuing with built-in streaming decryption.[/yellow]"
+                "Continuing with built-in streaming decryption."
             )
+            print(msg) if simple_mode else console.print(f"[yellow]{msg}[/yellow]")
             aria2c_enabled = False
+
+    if simple_mode:
+        state = {"single": False, "current": None}
+
+        def on_start(files, total):
+            state["single"] = len(files) == 1
+            label = files[0].name if state["single"] and files else f"{len(files)} file(s)"
+            print(f"Downloading {label} ({humanise_bytes(total)})")
+
+        def on_file_start(node, out_path):
+            state["current"] = node
+            if not state["single"]:
+                print(f"Starting: {node.name or node.handle}")
+
+        def on_file_progress(node, done, total):
+            percent = (done / total * 100) if total else 0
+            print(f"\rProgress: {humanise_bytes(done)} / {humanise_bytes(total)} ({percent:.1f}%)", end="", flush=True)
+
+        def on_file_done(node, out_path):
+            print(f"\rProgress: {humanise_bytes(node.size)} / {humanise_bytes(node.size)} (100.0%)")
+            print(f"Saved: {out_path}")
+
+        def on_skip(node, out_path):
+            print(f"Skipped existing file: {out_path} (use --force to overwrite)")
+
+        with Transferit() as tx:
+            return tx.download(
+                transfer_url,
+                output_root,
+                password=password,
+                force=force,
+                aria2c=aria2c_enabled,
+                on_start=on_start,
+                on_file_start=on_file_start,
+                on_file_progress=on_file_progress,
+                on_file_done=on_file_done,
+                on_skip=on_skip,
+            )
 
     with Progress(
         SpinnerColumn(),
@@ -614,18 +660,37 @@ def show_mega_download_summary(result, elapsed):
     table.add_row("elapsed", f"{elapsed:.1f}s [dim]({rate:.2f} MB/s)[/dim]")
     console.print(Panel(table, title="transfer.it", title_align="right", border_style="green", box=box.ROUNDED))
 
-def download_mega_with_retries(transfer_url, output_dir, attempts, password=None, force=False, quiet=False, aria2c_enabled=True):
+def show_mega_download_summary_simple(result, elapsed):
+    written = [p for p in result.paths if p not in result.skipped]
+    rate = (result.total_bytes / elapsed / 1e6) if elapsed else 0
+    print()
+    print("=" * 50)
+    print("SUCCESS!")
+    print("=" * 50)
+    print("Your download completed successfully.")
+    print(f"Files written: {len(written)}")
+    if result.skipped:
+        print(f"Files skipped: {len(result.skipped)}")
+    print(f"Size: {humanise_bytes(result.total_bytes)}")
+    print(f"Elapsed: {elapsed:.1f}s ({rate:.2f} MB/s)")
+    print(f"Saved to: {result.output_dir}")
+
+def download_mega_with_retries(transfer_url, output_dir, attempts, password=None, force=False, quiet=False, simple_mode=False, aria2c_enabled=True):
     last_error = None
     for attempt in range(1, attempts + 1):
         try:
-            if not quiet:
+            if simple_mode and not quiet:
+                print(f"Download attempt {attempt}/{attempts} using MEGA backend")
+            elif not quiet:
                 console.print(f"[cyan]Download attempt {attempt}/{attempts} using MEGA backend[/cyan]")
-            return download_from_transfer_it_mega(transfer_url, output_dir, password=password, force=force, quiet=quiet, aria2c_enabled=aria2c_enabled)
+            return download_from_transfer_it_mega(transfer_url, output_dir, password=password, force=force, quiet=quiet, simple_mode=simple_mode, aria2c_enabled=aria2c_enabled)
         except KeyboardInterrupt:
             raise
         except Exception as exc:
             last_error = exc
-            if not quiet:
+            if simple_mode and not quiet:
+                print(f"Download attempt {attempt} failed on MEGA backend: {exc}")
+            elif not quiet:
                 console.print(f"[yellow]⚠️ Download attempt {attempt} failed on MEGA backend: {exc}[/yellow]")
             if attempt < attempts:
                 time.sleep(min(2 * attempt, 10))
@@ -907,6 +972,7 @@ def show_usage():
         "[yellow]Usage:[/yellow] transferit download [options] <transfer_url> [output_directory]\n\n"
         "[yellow]Options:[/yellow]\n"
         "  --backend mega|browser   Download backend (default: mega)\n"
+        "  --simple                 Use simple text output\n"
         "  --aria2c / --no-aria2c   Enable/disable aria2c for all backends\n"
         "  -o, --output-dir PATH    Destination folder\n"
         "  -p, --password PASSWORD  Password for protected transfers\n"
@@ -927,6 +993,7 @@ def parse_args(argv):
     parser = argparse.ArgumentParser(prog="transferit download", description="Download transfer.it links")
     parser.add_argument("transfer_url", nargs="?", help="transfer.it URL or 12-character handle")
     parser.add_argument("positional_output_dir", nargs="?", help="Output directory (kept for old CLI compatibility)")
+    parser.add_argument("--simple", action="store_true", help="Use simple text output")
     parser.add_argument("--backend", choices=["mega", "browser"], help="Download backend (default from config: mega)")
     parser.add_argument("-o", "--output-dir", help="Output directory")
     parser.add_argument("-p", "--password", help="Password for protected transfers")
@@ -943,6 +1010,7 @@ def main(argv=None):
     """Main entry point"""
     args = parse_args(sys.argv[1:] if argv is None else argv)
     config = load_config()
+    simple_mode = args.simple and not args.json
     backend = resolve_download_backend(args.backend, config)
     output_dir = args.output_dir or args.positional_output_dir or config.get("download_dir")
     retry_count = int(config.get("retry_count", 3))
@@ -955,11 +1023,21 @@ def main(argv=None):
         console.print("[red]--json is only supported by the MEGA backend[/red]")
         sys.exit(2)
 
-    if not args.json:
+    if simple_mode:
+        print(f"transferit download (backend={backend})")
+    elif not args.json:
         console.print(f"\n[bold magenta]transferit download[/bold magenta] [dim]backend={backend}[/dim]\n")
 
     if not args.transfer_url:
-        show_usage()
+        if simple_mode:
+            print("Usage: transferit download [--backend mega|browser] [--simple] <transfer_url> [output_directory]")
+            print("Options:")
+            print("  --backend    Download backend: mega (default) or browser")
+            print("  --simple     Use simple text output")
+            print("  --aria2c     Use aria2c for faster downloads")
+            print("  --no-aria2c  Disable aria2c")
+        else:
+            show_usage()
         sys.exit(1)
 
     transfer_url = args.transfer_url
@@ -985,12 +1063,13 @@ def main(argv=None):
                     password=args.password,
                     force=args.force,
                     quiet=args.json,
+                    simple_mode=simple_mode,
                     aria2c_enabled=aria2c_enabled,
                 )
             except Exception as exc:
                 if args.json:
                     raise
-                console.print(f"[red]❌ MEGA backend failed: {exc}[/red]")
+                print(f"MEGA backend failed: {exc}") if simple_mode else console.print(f"[red]❌ MEGA backend failed: {exc}[/red]")
                 should_fallback = False
                 if not args.no_fallback and config.get("prompt_browser_fallback", True):
                     should_fallback = prompt_yes_no("MEGA backend failed. Retry using browser mode?", default=False)
@@ -1004,20 +1083,23 @@ def main(argv=None):
             print_json(result.to_json_dict())
             sys.exit(0)
         if backend == "mega" and result:
-            show_mega_download_summary(result, time.monotonic() - started)
-            console.print(f"\n[green]✨ Files saved to: {result.output_dir}[/green]")
+            if simple_mode:
+                show_mega_download_summary_simple(result, time.monotonic() - started)
+            else:
+                show_mega_download_summary(result, time.monotonic() - started)
+                console.print(f"\n[green]✨ Files saved to: {result.output_dir}[/green]")
             sys.exit(0)
         if result:
-            console.print(f"\n[green]✨ File saved to: {result}[/green]")
+            print(f"File saved to: {result}") if simple_mode else console.print(f"\n[green]✨ File saved to: {result}[/green]")
             sys.exit(0)
         else:
-            console.print("\n[red]❌ Download failed. Please try again.[/red]")
+            print("Download failed. Please try again.") if simple_mode else console.print("\n[red]❌ Download failed. Please try again.[/red]")
             sys.exit(1)
     except KeyboardInterrupt:
         # Signal handler will take care of cleanup
         pass
     except Exception as e:
-        console.print(f"\n[red]❌ Unexpected error: {e}[/red]")
+        print(f"Unexpected error: {e}") if simple_mode else console.print(f"\n[red]❌ Unexpected error: {e}[/red]")
         import traceback
         traceback.print_exc()
         full_cleanup(remove_partial=True)
