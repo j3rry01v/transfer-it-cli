@@ -1,0 +1,28 @@
+[project]
+name = "transfer-it-cli"
+version = "0.2.0"
+description = "Transfer.it uploader/downloader with MEGA direct backend and browser fallback."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+dependencies = [
+    "playwright>=1.40.0",
+    "rich>=13.0.0",
+    "httpx>=0.27",
+    "certifi>=2024.0.0",
+    "pycryptodomex>=3.21",
+    "websockets>=13.1",
+]
+
+[project.scripts]
+transferit = "transferit.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"transferit.mega" = ["py.typed"]

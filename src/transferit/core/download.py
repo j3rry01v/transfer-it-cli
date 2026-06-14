@@ -6,15 +6,41 @@ import atexit
 import termios
 import subprocess
 import shutil
+import argparse
 from pathlib import Path
 from urllib.parse import unquote
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeRemainingColumn, DownloadColumn, TransferSpeedColumn
 from rich.panel import Panel
 from rich.text import Text
 from rich.table import Table
 from rich import box
+
+from ..cli_common import print_json
+from ..config import load_config, prompt_yes_no, resolve_download_backend
+
+try:
+    from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
+except ImportError:
+    sync_playwright = None
+    PlaywrightTimeout = TimeoutError
+
+try:
+    from ..mega.client import Transferit
+except ImportError:
+    Transferit = None
+
+try:
+    from ..mega.actions.download import terminate_active_aria2c_process as terminate_mega_aria2c_process
+except ImportError:
+    terminate_mega_aria2c_process = None
+
+def reexec_with_packaged_python_if_available():
+    current = os.path.realpath(sys.executable)
+    for candidate in ("/usr/local/bin/python3", "/opt/homebrew/bin/python3"):
+        if os.path.exists(candidate) and os.path.realpath(candidate) != current:
+            os.execv(candidate, [candidate] + sys.argv)
+    return False
 
 console = Console()
 browser_instance = None
@@ -43,7 +69,7 @@ def restore_terminal_input():
         except:
             pass
 
-def kill_aria2c_processes():
+def kill_aria2c_processes(quiet=False):
     """Kill all aria2c processes"""
     try:
         # Method 1: Using psutil (most reliable)
@@ -52,7 +78,8 @@ def kill_aria2c_processes():
             for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
                 try:
                     if 'aria2c' in proc.info['name'] or (proc.info['cmdline'] and any('aria2c' in arg for arg in proc.info['cmdline'])):
-                        console.print(f"[yellow]Terminating aria2c process (PID: {proc.info['pid']})[/yellow]")
+                        if not quiet:
+                            console.print(f"[yellow]Stopping stray aria2c process (PID: {proc.info['pid']})...[/yellow]")
                         proc.terminate()
                         try:
                             proc.wait(timeout=3)
@@ -75,15 +102,17 @@ def kill_aria2c_processes():
             subprocess.run(['killall', 'aria2c'], capture_output=True)
             
     except Exception as e:
-        console.print(f"[yellow]Warning: Could not kill aria2c processes: {e}[/yellow]")
+        if not quiet:
+            console.print(f"[yellow]Warning: Could not stop aria2c processes: {e}[/yellow]")
 
-def cleanup_partial_download():
+def cleanup_partial_download(quiet=False):
     """Remove partial download files"""
     global download_file_path
     if download_file_path and os.path.exists(download_file_path):
         try:
             file_size_mb = os.path.getsize(download_file_path) / (1024 * 1024)
-            console.print(f"[yellow]🗑️  Removing partial download ({file_size_mb:.2f} MB): {download_file_path}[/yellow]")
+            if not quiet:
+                console.print(f"[yellow]Removing partial download ({file_size_mb:.2f} MB): {download_file_path}[/yellow]")
             os.remove(download_file_path)
             
             # Also remove aria2 control file if exists
@@ -92,7 +121,8 @@ def cleanup_partial_download():
                 os.remove(control_file)
                 
         except Exception as e:
-            console.print(f"[yellow]Warning: Could not remove partial file: {e}[/yellow]")
+            if not quiet:
+                console.print(f"[yellow]Warning: Could not remove partial file: {e}[/yellow]")
 
 def check_aria2c():
     """Check if aria2c is installed"""
@@ -120,7 +150,7 @@ def kill_existing_browsers(show_message=False):
         if processes_found and show_message:
             with Progress(
                 SpinnerColumn(),
-                TextColumn("🧹 Cleaning up existing browser processes..."),
+                TextColumn("Closing browser helper processes..."),
                 console=console,
                 transient=True
             ) as cleanup_progress:
@@ -148,19 +178,23 @@ def kill_existing_browsers(show_message=False):
         except:
             pass
 
-def full_cleanup(remove_partial=True):
+def full_cleanup(remove_partial=True, quiet=False):
     """Complete cleanup of all resources"""
     global browser_instance, aria2c_process
     
-    console.print("\n[yellow]🧹 Cleaning up resources...[/yellow]")
+    if not quiet:
+        console.print("\n[yellow]Shutting down active download cleanly...[/yellow]")
     
     # Restore terminal
+    if not quiet and original_terminal_settings:
+        console.print("[dim]Restoring terminal input settings...[/dim]")
     restore_terminal_input()
     
     # Kill aria2c process if running
     if aria2c_process:
         try:
-            console.print("[yellow]Terminating aria2c download...[/yellow]")
+            if not quiet:
+                console.print("[yellow]Stopping aria2c download process...[/yellow]")
             aria2c_process.terminate()
             try:
                 aria2c_process.wait(timeout=3)
@@ -170,31 +204,54 @@ def full_cleanup(remove_partial=True):
         except:
             pass
         aria2c_process = None
-    
+
+    if terminate_mega_aria2c_process is not None:
+        try:
+            stopped = terminate_mega_aria2c_process()
+            if stopped and not quiet:
+                console.print("[yellow]Stopped MEGA aria2c download process.[/yellow]")
+        except Exception as exc:
+            if not quiet:
+                console.print(f"[yellow]Warning: Could not stop MEGA aria2c process: {exc}[/yellow]")
+     
     # Kill any remaining aria2c processes
-    kill_aria2c_processes()
+    kill_aria2c_processes(quiet=quiet)
     
     # Clean up partial downloads if requested
     if remove_partial:
-        cleanup_partial_download()
+        cleanup_partial_download(quiet=quiet)
     
     # Close browser
     if browser_instance:
         try:
+            if not quiet:
+                console.print("[yellow]Closing browser session...[/yellow]")
             browser_instance.close()
         except:
             pass
         browser_instance = None
     
     # Kill browser processes
+    if not quiet:
+        console.print("[dim]Checking for leftover browser helper processes...[/dim]")
     kill_existing_browsers(show_message=False)
 
 def signal_handler(signum, frame):
     """Handle various signals gracefully"""
     signal_name = signal.Signals(signum).name
-    console.print(f"\n[yellow]⚠️  Received {signal_name} signal - Cleaning up...[/yellow]")
+    if signum == signal.SIGINT:
+        reason = "cancel request (Ctrl+C)"
+    elif signum == signal.SIGTSTP:
+        reason = "suspend request (Ctrl+Z)"
+    elif signum == signal.SIGTERM:
+        reason = "termination request"
+    elif signum == signal.SIGHUP:
+        reason = "terminal closed"
+    else:
+        reason = signal_name
+    console.print(f"\n[yellow]Download interrupted by {reason}.[/yellow]")
     full_cleanup(remove_partial=True)
-    console.print("[red]❌ Download cancelled[/red]")
+    console.print("[red]Download stopped.[/red]")
     sys.exit(130 if signum == signal.SIGINT else 1)
 
 # Register signal handlers for various interruption scenarios
@@ -204,7 +261,7 @@ signal.signal(signal.SIGTSTP, signal_handler)  # Ctrl+Z
 signal.signal(signal.SIGHUP, signal_handler)   # Terminal closed
 
 # Cleanup on normal exit
-atexit.register(lambda: full_cleanup(remove_partial=False))
+atexit.register(lambda: full_cleanup(remove_partial=False, quiet=True))
 
 def show_transfer_info(transfer_url):
     """Display transfer link information"""
@@ -321,7 +378,9 @@ def download_with_aria2c(download_url, output_path, file_name, expected_size_byt
     
     download_file_path = output_path  # Track the file for cleanup
     
-    console.print(f"\n[cyan]🚀 Starting download with aria2c...[/cyan]")
+    console.print("\n[cyan]Browser backend is using aria2c as the download accelerator.[/cyan]")
+    console.print("[dim]aria2c runs as a separate process; press Ctrl+C to stop it and remove the partial file.[/dim]")
+    console.print(f"[cyan]Starting aria2c download...[/cyan]")
     console.print(f"[dim]Output: {output_path}[/dim]")
     console.print(f"[dim]Press Ctrl+C to cancel download and cleanup[/dim]\n")
     
@@ -441,12 +500,147 @@ def download_with_aria2c(download_url, output_path, file_name, expected_size_byt
     finally:
         aria2c_process = None
 
+def humanise_bytes(num_bytes):
+    units = ["B", "KB", "MB", "GB", "TB"]
+    value = float(num_bytes or 0)
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            return f"{value:.2f} {unit}" if unit != "B" else f"{int(value)} B"
+        value /= 1024
+
+def download_from_transfer_it_mega(transfer_url, output_dir, password=None, force=False, quiet=False, aria2c_enabled=True):
+    if Transferit is None:
+        reexec_with_packaged_python_if_available()
+        raise RuntimeError("MEGA backend dependencies are missing. Run: python3 -m pip install -r requirements.txt")
+
+    output_root = Path(output_dir).expanduser().resolve()
+    output_root.mkdir(parents=True, exist_ok=True)
+    if quiet:
+        with Transferit() as tx:
+            return tx.download(transfer_url, output_root, password=password, force=force, aria2c=aria2c_enabled)
+
+    console.print(f"[cyan]⚡ Using MEGA backend[/cyan]")
+    console.print(f"[dim]Output directory: {output_root}[/dim]")
+    if aria2c_enabled:
+        if shutil.which("aria2c"):
+            console.print("[cyan]aria2c enabled for encrypted blob download + local decryption[/cyan]")
+        else:
+            console.print(
+                "[yellow]aria2c not found.[/yellow] Install for faster downloads:\n"
+                "  macOS:    brew install aria2\n"
+                "  Ubuntu:   sudo apt-get install aria2\n"
+                "  Fedora:   sudo dnf install aria2\n"
+                "[yellow]Continuing with built-in streaming decryption.[/yellow]"
+            )
+            aria2c_enabled = False
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        TextColumn("•"),
+        DownloadColumn(),
+        TextColumn("•"),
+        TransferSpeedColumn(),
+        TextColumn("•"),
+        TimeRemainingColumn(),
+        console=console,
+        refresh_per_second=2,
+    ) as progress:
+        overall = progress.add_task("📥 Preparing download...", total=1)
+        state = {"single": False, "current": None}
+
+        def on_start(files, total):
+            state["single"] = len(files) == 1
+            label = files[0].name if state["single"] and files else f"{len(files)} file(s)"
+            progress.update(overall, description=f"📥 Downloading {label}", total=total or 1)
+
+        def on_file_start(node, out_path):
+            if state["single"]:
+                return
+            state["current"] = progress.add_task(node.name or node.handle, total=node.size or 1)
+
+        def on_file_progress(node, done, total):
+            if state["single"]:
+                progress.update(overall, completed=done, total=total or 1)
+            elif state["current"] is not None:
+                progress.update(state["current"], completed=done, total=total or 1)
+
+        def on_file_done(node, out_path):
+            if state["single"]:
+                progress.update(overall, completed=node.size or 1)
+                return
+            current = state.get("current")
+            if current is not None:
+                progress.update(current, completed=node.size or 1)
+                progress.remove_task(current)
+                state["current"] = None
+            progress.advance(overall, node.size or 0)
+
+        def on_skip(node, out_path):
+            progress.console.print(f"[yellow]skip[/yellow] {out_path} (use --force to overwrite)")
+            if state["single"]:
+                progress.update(overall, completed=node.size or 0)
+            else:
+                progress.advance(overall, node.size or 0)
+
+        with Transferit() as tx:
+            result = tx.download(
+                transfer_url,
+                output_root,
+                password=password,
+                force=force,
+                aria2c=aria2c_enabled,
+                on_start=on_start,
+                on_file_start=on_file_start,
+                on_file_progress=on_file_progress,
+                on_file_done=on_file_done,
+                on_skip=on_skip,
+            )
+
+    return result
+
+def show_mega_download_summary(result, elapsed):
+    written = [p for p in result.paths if p not in result.skipped]
+    rate = (result.total_bytes / elapsed / 1e6) if elapsed else 0
+    table = Table.grid(padding=(0, 2))
+    table.add_column(style="dim", justify="right")
+    table.add_column(overflow="fold")
+    table.add_row("source", result.xh)
+    table.add_row("destination", result.output_dir)
+    table.add_row("files", f"{len(written)} written" + (f", [yellow]{len(result.skipped)} skipped[/yellow]" if result.skipped else ""))
+    table.add_row("size", f"{humanise_bytes(result.total_bytes)} [dim]({result.total_bytes:,} bytes)[/dim]")
+    table.add_row("elapsed", f"{elapsed:.1f}s [dim]({rate:.2f} MB/s)[/dim]")
+    console.print(Panel(table, title="transfer.it", title_align="right", border_style="green", box=box.ROUNDED))
+
+def download_mega_with_retries(transfer_url, output_dir, attempts, password=None, force=False, quiet=False, aria2c_enabled=True):
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        try:
+            if not quiet:
+                console.print(f"[cyan]Download attempt {attempt}/{attempts} using MEGA backend[/cyan]")
+            return download_from_transfer_it_mega(transfer_url, output_dir, password=password, force=force, quiet=quiet, aria2c_enabled=aria2c_enabled)
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:
+            last_error = exc
+            if not quiet:
+                console.print(f"[yellow]⚠️ Download attempt {attempt} failed on MEGA backend: {exc}[/yellow]")
+            if attempt < attempts:
+                time.sleep(min(2 * attempt, 10))
+    raise RuntimeError(f"MEGA download failed after {attempts} attempt(s): {last_error}")
+
 def get_download_info(url: str):
     """
     Automates capturing the download URL, original filename, and the descriptive title.
     Returns: A tuple (download_url, original_filename, descriptive_title, file_info), or None on failure.
     """
     global browser_instance
+    if sync_playwright is None:
+        reexec_with_packaged_python_if_available()
+        console.print("[red]❌ Playwright is not installed. Run: python3 -m pip install -r requirements.txt[/red]")
+        return None
     
     with sync_playwright() as p:
         browser_instance = p.chromium.launch(
@@ -462,7 +656,8 @@ def get_download_info(url: str):
         page = context.new_page()
         
         try:
-            console.print(f"[cyan]🌐 Navigating to {url}...[/cyan]")
+            console.print(f"[cyan]🌐 Using browser session[/cyan]")
+            console.print(f"[cyan]Navigating to {url}...[/cyan]")
             page.goto(url, timeout=60000, wait_until="domcontentloaded")
             
             # Check for cookie banner
@@ -519,7 +714,82 @@ def get_download_info(url: str):
                 browser_instance.close()
                 browser_instance = None
 
-def download_from_transfer_it(transfer_url, output_dir="./downloads"):
+def download_with_browser_native(transfer_url, output_dir):
+    """Download through Playwright without aria2c."""
+    global browser_instance, download_file_path
+    if sync_playwright is None:
+        reexec_with_packaged_python_if_available()
+        console.print("[red]❌ Playwright is not installed. Run: python3 -m pip install -r requirements.txt[/red]")
+        return None
+
+    output_root = Path(output_dir).expanduser().resolve()
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    with sync_playwright() as p:
+        browser_instance = p.chromium.launch(
+            headless=True,
+            args=['--disable-blink-features=AutomationControlled']
+        )
+        context = browser_instance.new_context(
+            accept_downloads=True,
+            locale='en-US',
+            extra_http_headers={'Accept-Language': 'en-US,en;q=0.9'}
+        )
+        page = context.new_page()
+        try:
+            console.print(f"[cyan]🌐 Using browser download session[/cyan]")
+            console.print(f"[cyan]Navigating to {transfer_url}...[/cyan]")
+            page.goto(transfer_url, timeout=60000, wait_until="domcontentloaded")
+            try:
+                page.get_by_role("button", name="Accept all").click(timeout=10000)
+            except PlaywrightTimeout:
+                pass
+            page.wait_for_timeout(3000)
+            file_info = extract_file_info(page)
+            download_button = find_download_button(page)
+            if not download_button:
+                console.print("[red]❌ Download button not found[/red]")
+                return None
+
+            console.print("[cyan]📥 Starting browser download...[/cyan]")
+            with page.expect_download(timeout=30000) as download_info:
+                download_button.click()
+            download = download_info.value
+
+            suggested = download.suggested_filename or unquote(download.url.split('/')[-1].split('?')[0]) or "transfer-it-download"
+            descriptive_title = file_info.get('name', '')
+            if descriptive_title and descriptive_title != "Multiple files":
+                safe_title = descriptive_title.replace('/', '-').replace('\\', '-').replace(':', ' -')
+                file_name = f"{safe_title}.zip" if suggested.endswith('.zip') else safe_title
+            else:
+                file_name = suggested
+                if descriptive_title == "Multiple files" and not file_name.endswith('.zip'):
+                    file_name = f"{file_name}.zip"
+
+            output_path = output_root / file_name
+            download_file_path = str(output_path)
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                console=console,
+            ) as progress:
+                task = progress.add_task(f"Saving {file_name}...", total=None)
+                download.save_as(str(output_path))
+                progress.update(task, description="✅ Browser download complete")
+
+            download_file_path = None
+            file_size_mb = output_path.stat().st_size / (1024 * 1024) if output_path.exists() else 0
+            show_download_success(str(output_path), file_name, file_size_mb, download.url)
+            return str(output_path)
+        except Exception as e:
+            console.print(f"[red]❌ Browser download failed: {e}[/red]")
+            return None
+        finally:
+            if browser_instance:
+                browser_instance.close()
+                browser_instance = None
+
+def download_from_transfer_it(transfer_url, output_dir="./downloads", aria2c_enabled=True):
     """Main function to download from transfer.it"""
     global download_file_path
     
@@ -527,6 +797,12 @@ def download_from_transfer_it(transfer_url, output_dir="./downloads"):
         console.print("[red]❌ Invalid transfer.it URL[/red]")
         return None
     
+    if not aria2c_enabled:
+        console.print("[yellow]aria2c disabled; using browser download session.[/yellow]")
+        show_transfer_info(transfer_url)
+        kill_existing_browsers(show_message=True)
+        return download_with_browser_native(transfer_url, output_dir)
+
     # Check if aria2c is installed
     if not check_aria2c():
         install_aria2c()
@@ -627,44 +903,110 @@ def show_download_success(file_path, file_name, file_size_mb, download_url):
 def show_usage():
     """Display usage information"""
     console.print(Panel.fit(
-        "[bold cyan]Transfer.it CLI Downloader (with aria2c)[/bold cyan]\n\n"
-        "[yellow]Usage:[/yellow] python3 transfer-it-downloader.py <transfer_url> [output_directory]\n\n"
+        "[bold cyan]Transfer.it CLI Downloader[/bold cyan]\n\n"
+        "[yellow]Usage:[/yellow] transferit download [options] <transfer_url> [output_directory]\n\n"
+        "[yellow]Options:[/yellow]\n"
+        "  --backend mega|browser   Download backend (default: mega)\n"
+        "  --aria2c / --no-aria2c   Enable/disable aria2c for all backends\n"
+        "  -o, --output-dir PATH    Destination folder\n"
+        "  -p, --password PASSWORD  Password for protected transfers\n"
+        "  -f, --force              Overwrite existing files in MEGA mode\n"
+        "  --json                   Print machine-readable JSON in MEGA mode\n"
+        "  --no-fallback            Do not ask to retry with browser mode\n\n"
         "[yellow]Examples:[/yellow]\n"
-        "  python3 transfer-it-downloader.py https://transfer.it/t/abc123def456\n"
-        "  python3 transfer-it-downloader.py https://transfer.it/t/abc123def456 ./my-downloads\n\n"
+        "  transferit download https://transfer.it/t/abc123def456\n"
+        "  transferit download --backend browser --aria2c https://transfer.it/t/abc123def456 ./my-downloads\n\n"
         "[yellow]Requirements:[/yellow]\n"
-        "  • aria2c must be installed on your system\n"
-        "  • playwright (pip install playwright)\n"
-        "  • rich (pip install rich)\n"
-        "  • psutil (pip install psutil) - for better process management\n\n"
-        "[dim]Default output directory: ./downloads[/dim]",
+        "  • Python 3.11+\n"
+        "  • aria2c is optional and only used by browser backend\n\n"
+        "[dim]Default output directory comes from config, initially ~/Downloads[/dim]",
         border_style="blue"
     ))
 
-def main():
+def parse_args(argv):
+    parser = argparse.ArgumentParser(prog="transferit download", description="Download transfer.it links")
+    parser.add_argument("transfer_url", nargs="?", help="transfer.it URL or 12-character handle")
+    parser.add_argument("positional_output_dir", nargs="?", help="Output directory (kept for old CLI compatibility)")
+    parser.add_argument("--backend", choices=["mega", "browser"], help="Download backend (default from config: mega)")
+    parser.add_argument("-o", "--output-dir", help="Output directory")
+    parser.add_argument("-p", "--password", help="Password for protected transfers")
+    parser.add_argument("-f", "--force", action="store_true", help="Overwrite existing files in MEGA mode")
+    parser.add_argument("--no-fallback", action="store_true", help="Do not ask to retry with browser mode if MEGA fails")
+    parser.add_argument("--json", action="store_true", help="Print machine-readable JSON in MEGA mode")
+    aria = parser.add_mutually_exclusive_group()
+    aria.add_argument("--aria2c", dest="aria2c", action="store_true", help="Use aria2c for faster downloads (MEGA: encrypted blob + local decrypt; browser: accelerator)")
+    aria.add_argument("--no-aria2c", dest="aria2c", action="store_false", help="Disable aria2c")
+    parser.set_defaults(aria2c=None)
+    return parser.parse_args(argv)
+
+def main(argv=None):
     """Main entry point"""
-    console.print("\n[bold magenta]🚀 Transfer.it CLI Downloader (powered by aria2c)[/bold magenta]\n")
-    
-    if len(sys.argv) < 2:
+    args = parse_args(sys.argv[1:] if argv is None else argv)
+    config = load_config()
+    backend = resolve_download_backend(args.backend, config)
+    output_dir = args.output_dir or args.positional_output_dir or config.get("download_dir")
+    retry_count = int(config.get("retry_count", 3))
+    aria2c_enabled = config.get("aria2c_enabled", True) if args.aria2c is None else args.aria2c
+
+    if (backend == "mega" and Transferit is None) or (backend == "browser" and sync_playwright is None):
+        reexec_with_packaged_python_if_available()
+
+    if args.json and backend != "mega":
+        console.print("[red]--json is only supported by the MEGA backend[/red]")
+        sys.exit(2)
+
+    if not args.json:
+        console.print(f"\n[bold magenta]transferit download[/bold magenta] [dim]backend={backend}[/dim]\n")
+
+    if not args.transfer_url:
         show_usage()
         sys.exit(1)
-    
-    transfer_url = sys.argv[1]
-    output_dir = sys.argv[2] if len(sys.argv) > 2 else "./downloads"
-    
-    if not transfer_url.startswith('http'):
-        console.print("[red]❌ Error: Please provide a valid transfer.it URL[/red]")
-        show_usage()
-        sys.exit(1)
-    
-    if 'transfer.it/t/' not in transfer_url:
-        console.print("[red]❌ Error: This doesn't appear to be a valid transfer.it link[/red]")
-        console.print("[dim]Valid links look like: https://transfer.it/t/XXXXXXXXX[/dim]")
-        sys.exit(1)
-    
+
+    transfer_url = args.transfer_url
+
+    if backend == "browser":
+        if not transfer_url.startswith('http'):
+            console.print("[red]❌ Browser backend needs a full transfer.it URL, not a bare handle[/red]")
+            show_usage()
+            sys.exit(1)
+        if 'transfer.it/t/' not in transfer_url:
+            console.print("[red]❌ Error: This doesn't appear to be a valid transfer.it link[/red]")
+            console.print("[dim]Valid links look like: https://transfer.it/t/XXXXXXXXX[/dim]")
+            sys.exit(1)
+
     try:
-        result = download_from_transfer_it(transfer_url, output_dir)
+        started = time.monotonic()
+        if backend == "mega":
+            try:
+                result = download_mega_with_retries(
+                    transfer_url,
+                    output_dir,
+                    retry_count,
+                    password=args.password,
+                    force=args.force,
+                    quiet=args.json,
+                    aria2c_enabled=aria2c_enabled,
+                )
+            except Exception as exc:
+                if args.json:
+                    raise
+                console.print(f"[red]❌ MEGA backend failed: {exc}[/red]")
+                should_fallback = False
+                if not args.no_fallback and config.get("prompt_browser_fallback", True):
+                    should_fallback = prompt_yes_no("MEGA backend failed. Retry using browser mode?", default=False)
+                if not should_fallback:
+                    sys.exit(1)
+                result = download_from_transfer_it(transfer_url, output_dir, aria2c_enabled=aria2c_enabled)
+        else:
+            result = download_from_transfer_it(transfer_url, output_dir, aria2c_enabled=aria2c_enabled)
         
+        if args.json and result:
+            print_json(result.to_json_dict())
+            sys.exit(0)
+        if backend == "mega" and result:
+            show_mega_download_summary(result, time.monotonic() - started)
+            console.print(f"\n[green]✨ Files saved to: {result.output_dir}[/green]")
+            sys.exit(0)
         if result:
             console.print(f"\n[green]✨ File saved to: {result}[/green]")
             sys.exit(0)
